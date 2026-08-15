@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { ai, CHAT_MODEL } from "./ai";
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 import {
   persistExtraction,
   searchNodes,
@@ -79,6 +83,82 @@ const Consolidation = z.object({
   merges: z.array(z.object({ keep: z.string(), drop: z.string() })).default([]),
   insight: z.string().default(""),
 });
+
+// ── The remember tool (MemGPT/Letta pattern) ─────────────────────────────────
+// The chat model itself decides mid-reply what's worth saving — the gating cost
+// rides on the reply call, so memory writes cost ZERO extra LLM calls. The rules
+// below are ported from brain/extract.md; the digest-cadence extraction
+// (extractFromStretch, fired every ~12 messages) is the safety net for misses.
+const REMEMBER_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "remember",
+    description: [
+      "Save lasting facts to long-term memory. Call this WHILE writing your normal reply —",
+      "the user never sees the call, and you must ALWAYS still write your reply text.",
+      "",
+      "WHEN to call: the user reveals something with a shelf life — people, orgs, projects,",
+      "places, tasks/commitments, preferences, decisions, plans, corrections to older facts,",
+      "or anything about THE USER themselves (habits, goals, style feedback, personal details).",
+      "WHEN NOT to call: small talk, questions, one-off jokes, transient chatter.",
+      "",
+      "RULES:",
+      "- Reuse the EXACT name of existing memory nodes (see 'Recalled memories' and the profile in context) — never mint near-duplicates",
+      "- No orphan nodes: link every new node with an edge to something known (or to another new node)",
+      "- Fewer, deeper nodes — hard cap 3 new nodes per call; minute details belong in attrs, not as nodes",
+      "- Facts about the user go on their profile node via updates.set_attrs with flat dot-keys (e.g. 'habit.running', 'style.length') — never as separate nodes",
+      "- Corrected/superseded facts → an updates entry on the EXACT existing node (set_attrs / rename / close_edges)",
+      "- Forget ONLY on an explicit user request: updates entry with forget=true",
+      "- Resolve relative dates ('this Friday') to ISO dates using today's date",
+    ].join("\n"),
+    parameters: {
+      type: "object",
+      properties: {
+        nodes: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string" },
+              name: { type: "string" },
+              attrs: { type: "object", additionalProperties: true },
+            },
+            required: ["type", "name"],
+          },
+        },
+        edges: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              src: { type: "string" },
+              dst: { type: "string" },
+              type: { type: "string" },
+              said_on: { type: "string" },
+              due_by: { type: "string" },
+            },
+            required: ["src", "dst", "type"],
+          },
+        },
+        updates: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              node: { type: "string" },
+              set_attrs: { type: "object", additionalProperties: true },
+              rename: { type: "string" },
+              close_edges: { type: "array", items: { type: "string" } },
+              forget: { type: "boolean" },
+            },
+            required: ["node"],
+          },
+        },
+      },
+      required: ["nodes", "edges"],
+    },
+  },
+};
 
 /** JSON-mode chat call: temperature 0 (deterministic — fewer malformed outputs)
  *  plus one retry with a nudge when parsing still fails. Returns null on failure. */
@@ -205,18 +285,37 @@ export async function runExtraction(text: string) {
     return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
   }
 
-  // --- Persist to the memory graph — batched + atomic (see persistExtraction) ---
+  // --- Persist to the memory graph + apply revision entries (shared helper) ---
+  const r = await applyExtraction(text, parsed.data, [...known.values()]);
+  return {
+    ok: true as const,
+    dumpId: r.dumpId,
+    nodes: { created: r.created, reused: r.reused },
+    edgesCreated: r.edgesCreated,
+    updated: r.updated,
+    forgotten: r.forgotten,
+  };
+}
+
+/** Persist a validated extraction atomically (nodes/edges via persistExtraction),
+ *  then apply revision entries — update / supersede / forget. Shared by silent
+ *  digest extraction (runExtraction) and tool-called remembers (applyRemembered). */
+async function applyExtraction(
+  sourceText: string,
+  data: z.infer<typeof Extraction>,
+  known: { id: string; type: string; name: string }[]
+) {
   const { dumpId, created, reused, edgesCreated } = await persistExtraction(
-    text,
-    parsed.data.nodes,
-    parsed.data.edges,
-    [...known.values()]
+    sourceText,
+    data.nodes,
+    data.edges,
+    known
   );
 
   // --- Revision: update / supersede / forget existing memory ---
   const updated: string[] = [];
   const forgotten: string[] = [];
-  for (const u of parsed.data.updates) {
+  for (const u of data.updates) {
     if (u.forget) {
       const f = await forgetNode(u.node);
       if (f) forgotten.push(f.name);
@@ -228,25 +327,18 @@ export async function runExtraction(text: string) {
       if (u.close_edges.length) await closeEdges(up.id, u.close_edges);
     }
   }
-
-  return { ok: true as const, dumpId, nodes: { created, reused }, edgesCreated, updated, forgotten };
+  return { dumpId, created, reused, edgesCreated, updated, forgotten };
 }
 
-/** Conversational chat: silent background memory write + grounded streamed reply.
- *  The profile and open loops are ALWAYS in context — this is what makes Sanctum
- *  feel like it knows you better every time. */
+/** Conversational chat: tool-called memory writes + grounded streamed reply.
+ *  The reply call carries the `remember` tool — the model decides mid-reply what
+ *  to save (zero extra LLM calls), and digest-cadence extraction is the safety
+ *  net. The profile and open loops are ALWAYS in context — this is what makes
+ *  Sanctum feel like it knows you better every time. */
 export async function chat(messages: ChatMessage[]) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
 
-  // Ensure the profile exists BEFORE extraction fires, so user-facts have a home
   const profile = await ensureProfile();
-
-  // 🧠 Silent memory: fire-and-forget — the reply NEVER waits for extraction
-  if (lastUser.trim()) {
-    runExtraction(lastUser)
-      .then((r) => console.log("🧠 memory:", JSON.stringify(r)))
-      .catch((e) => console.error("🧠 memory write failed:", e));
-  }
 
   // Recall from the last few user turns, not just the latest — follow-ups like
   // "what did he say about it?" carry no entity names on their own.
@@ -286,12 +378,85 @@ ${ctx.text}`;
 
   // Windowed history: digests crystallize older stretches into the graph, so the
   // model only needs the recent tail — token cost stays bounded as sessions grow.
+  const requestMessages: ChatCompletionMessageParam[] = [
+    { role: "system", content: system },
+    ...messages
+      .slice(-MAX_CHAT_HISTORY)
+      .map((m): ChatCompletionMessageParam => ({ role: m.role, content: m.content })),
+  ];
+
+  // 🧠 The `remember` tool rides on this very call — the reply stream may carry
+  // tool_call deltas alongside (or instead of) content. route.ts accumulates and
+  // persists them; requestMessages is returned so the tool loop can be closed.
   const stream = await ai().chat.completions.create({
     model: CHAT_MODEL,
     stream: true,
-    messages: [{ role: "system", content: system }, ...messages.slice(-MAX_CHAT_HISTORY)],
+    tools: [REMEMBER_TOOL],
+    tool_choice: "auto",
+    messages: requestMessages,
   });
-  return { stream, recalled: ctx.ids, recalledNames: ctx.names };
+  return { stream, recalled: ctx.ids, recalledNames: ctx.names, requestMessages };
+}
+
+/** 🧠 Tool-called memory write: the chat model decided mid-reply that something
+ *  was worth saving, so the gating cost already rode on the reply call. Validates
+ *  + persists exactly like silent extraction; the known set stays empty —
+ *  persistExtraction resolves names against the DB itself (exact → norm → vector). */
+export async function applyRemembered(sourceText: string, argsJson: string) {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(argsJson);
+  } catch {
+    return { ok: false as const, error: "tool arguments were not valid JSON" };
+  }
+  const parsed = Extraction.safeParse(raw);
+  if (!parsed.success) {
+    return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
+  }
+  const r = await applyExtraction(sourceText, parsed.data, []);
+  return { ok: true as const, ...r };
+}
+
+/** Phase 2 of the tool loop: the model called remember INSTEAD of replying
+ *  (empty content). Feed the tool result back and stream the real reply —
+ *  no tools this time, so the loop can't recurse. */
+export async function continueChat(
+  requestMessages: ChatCompletionMessageParam[],
+  toolCalls: { id: string; name: string; arguments: string }[]
+) {
+  const calls = toolCalls.map((tc, i) => ({
+    id: tc.id || `call_${i}`,
+    type: "function" as const,
+    function: { name: tc.name, arguments: tc.arguments },
+  }));
+  return ai().chat.completions.create({
+    model: CHAT_MODEL,
+    stream: true,
+    messages: [
+      ...requestMessages,
+      { role: "assistant", content: null, tool_calls: calls },
+      ...calls.map(
+        (c): ChatCompletionMessageParam => ({
+          role: "tool",
+          tool_call_id: c.id,
+          content: "✓ Saved to long-term memory.",
+        })
+      ),
+    ],
+  });
+}
+
+/** 🌙 Safety-net extraction over a conversation stretch — catches lasting facts
+ *  the in-reply remember tool didn't fire on. Runs at digest cadence (~12 msgs),
+ *  so extraction cost amortizes ~12× vs the old per-message silent extraction. */
+export async function extractFromStretch(messages: ChatMessage[]) {
+  const transcript = messages
+    .filter((m) => m.content.trim())
+    .map((m) => `${m.role === "user" ? "User" : "Sanctum"}: ${m.content}`)
+    .join("\n")
+    .slice(0, 6000);
+  if (!transcript) return { ok: false as const, error: "empty stretch" };
+  return runExtraction(transcript);
 }
 
 /**
