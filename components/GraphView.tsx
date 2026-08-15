@@ -293,9 +293,10 @@ export default function GraphView() {
         nodeCanvasObject={(node: any, ctx: CanvasRenderingContext2D, scale: number) => {
           // ☀️ the pinned profile node is the sun of the cosmos — warm, bigger, brighter
           const isSun = !!node.pinned;
-          const color = isSun ? "#fcd34d" : colorFor(node.type);
+          const isDigest = node.type === "Conversation"; // session digests: quiet dust, not stars
+          const color = isSun ? "#fcd34d" : isDigest ? "#475569" : colorFor(node.type);
           const r =
-            (isSun ? 6.5 : 4) +
+            (isSun ? 6.5 : isDigest ? 2 : 4) +
             (degrees.get(node.id) ?? 0) * 1.6 +
             Math.min(Math.log1p(node.mention_count ?? 1) * 0.5, 2.5); // grows with use
 

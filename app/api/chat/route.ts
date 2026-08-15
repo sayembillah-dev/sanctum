@@ -31,9 +31,9 @@ export async function POST(req: Request) {
             return name && reply.toLowerCase().includes(name.toLowerCase());
           });
           if (used.length) markRecallUsed(used).catch(() => {});
-          // every 6 messages, crystallize the recent stretch into a digest node
-          if (messages.length >= 6 && messages.length % 6 === 0) {
-            summarizeConversation(messages.slice(-12))
+          // every 12 messages, crystallize the recent stretch into a digest node
+          if (messages.length >= 12 && messages.length % 12 === 0) {
+            summarizeConversation(messages.slice(-16))
               .then((r) => console.log("🌙 digest:", JSON.stringify(r)))
               .catch((e) => console.error("🌙 digest failed:", e));
           }

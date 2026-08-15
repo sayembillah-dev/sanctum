@@ -296,11 +296,9 @@ export async function createDigest(d: {
   messageCount: number;
   mentionedIds: string[];
 }) {
-  const stamp = new Date();
-  const name = `Conversation ${stamp.toLocaleDateString("en-CA")} ${stamp.toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-  })}`;
+  // name from the summary itself — meaningful in recall & the cosmos; timestamp stays in attrs
+  const gist = d.summary.replace(/\s+/g, " ").trim();
+  const name = `💬 ${gist.slice(0, 60)}${gist.length > 60 ? "…" : ""}`;
   const node = await prisma.node.create({
     data: {
       type: "Conversation",
