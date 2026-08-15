@@ -596,10 +596,18 @@ export async function summarizeConversation(messages: ChatMessage[]) {
   if (substantive.length < 4) return { ok: false as const, reason: "too short to digest" };
 
   const [digestMd, known] = await Promise.all([brain("digest.md"), recentNodes(60)]);
-  const transcript = substantive
-    .map((m) => `${m.role === "user" ? "User" : "Sanctum"}: ${m.content}`)
-    .join("\n")
-    .slice(0, 6000);
+  // Hermes micro-compaction asymmetry (docs/micro-compaction.md): user messages
+  // are the source of truth and stay (near-)verbatim; assistant turns are
+  // derived narration, truncated hard — the gist survives, the tokens don't.
+  const joined = substantive
+    .map((m) => {
+      const body = m.role === "user" ? m.content.slice(0, 1200) : m.content.slice(0, 280);
+      return `${m.role === "user" ? "User" : "Sanctum"}: ${body}`;
+    })
+    .join("\n");
+  // Keep the RECENT end of the stretch; drop a possibly-partial first line.
+  const transcript =
+    joined.length <= 6000 ? joined : joined.slice(joined.length - 6000).replace(/^[^\n]*\n/, "");
 
   const parsedJson = await chatJson(
     `${digestMd}\n\n# Known memory nodes (for "mentioned")\n${known.map((n) => `- ${n.name}`).join("\n") || "(none)"}\n\nToday's date: ${localToday()}`,
