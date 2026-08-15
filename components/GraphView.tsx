@@ -350,12 +350,19 @@ export default function GraphView() {
       load();
     };
     const onRecalled = (e: Event) => {
-      const ids: string[] = (e as CustomEvent).detail?.ids ?? [];
+      // Chat.tsx dispatches detail = the id ARRAY itself (not { ids }) — the
+      // old detail?.ids read silently yielded [] and pulses never fired at all
+      const d = (e as CustomEvent).detail;
+      const ids: string[] = Array.isArray(d) ? d : (d?.ids ?? []);
       const now = performance.now();
-      ids.forEach((id) => pulses.current.set(id, now));
-      // light the synapses BETWEEN recalled neurons — both endpoints recalled
-      // means the model connected them to build this reply
       const s = new Set(ids);
+      // the pinned profile is ALWAYS in the system prompt though excluded from
+      // the recall list (buildContext) — it earns a pulse on every reply, so
+      // profile-sourced answers (family.father etc.) still light the sun
+      for (const n of dataRef.current.nodes) if (n.pinned) s.add(n.id);
+      s.forEach((id) => pulses.current.set(id, now));
+      // light the synapses BETWEEN lit neurons — both endpoints recalled means
+      // the model connected them to build this reply
       for (const l of dataRef.current.links) {
         const a = idOf(l.source);
         const b = idOf(l.target);
