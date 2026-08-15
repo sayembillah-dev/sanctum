@@ -118,7 +118,7 @@ export default function GraphView() {
     if (total < 2) return;
     setPlaying(true);
     const t0 = performance.now();
-    const dur = Math.min(Math.max(total * 130, 2500), 20000);
+    const dur = Math.min(Math.max(total * 280, 3500), 30000);
     const tick = () => {
       const p = (performance.now() - t0) / dur;
       if (p >= 1) {
@@ -431,7 +431,7 @@ export default function GraphView() {
           // with a slight overshoot (easeOutBack), then releases to physics
           const pop = pops.current.get(n.id);
           if (pop) {
-            const p = Math.min(1, (performance.now() - pop.t0) / 700);
+            const p = Math.min(1, (performance.now() - pop.t0) / 1150);
             const e = 1 + 2.70158 * Math.pow(p - 1, 3) + 1.70158 * Math.pow(p - 1, 2); // easeOutBack (overshoot)
             // known destination (timelapse): lerp parent → settled spot;
             // fresh live entry: legacy 90px ray in a random direction
@@ -461,7 +461,7 @@ export default function GraphView() {
 
           // bloom-in (timelapse / freshly extracted neurons): easeOutCubic over ~0.9s
           const tB = births.current.get(n.id);
-          const birthF = tB === undefined ? 1 : Math.min(1, (performance.now() - tB) / 900);
+          const birthF = tB === undefined ? 1 : Math.min(1, (performance.now() - tB) / 1300);
           if (birthF >= 1 && tB !== undefined) births.current.delete(n.id);
           const eB = 1 - Math.pow(1 - birthF, 3);
           // pop kick: easeOutBack overshoot on the RADIUS (alpha stays easeOutCubic)
@@ -509,7 +509,7 @@ export default function GraphView() {
           const v = lerpTo(linkFx.current, `${a}|${b}`, target, 0.16);
           // grow-in: synapses revealed by the timelapse fade/widen over ~0.6s
           const kb = linkBirths.current.get(`${a}|${b}`);
-          const kf = kb === undefined ? 1 : Math.min(1, (performance.now() - kb) / 600);
+          const kf = kb === undefined ? 1 : Math.min(1, (performance.now() - kb) / 950);
           if (kb !== undefined && kf >= 1) linkBirths.current.delete(`${a}|${b}`);
           return v >= 0
             ? // ease slate → lit indigo
@@ -523,7 +523,7 @@ export default function GraphView() {
           const k = `${idOf(l.source)}|${idOf(l.target)}`;
           const v = linkFx.current.get(k) ?? 0;
           const kb = linkBirths.current.get(k);
-          const kf = kb === undefined ? 1 : 0.3 + 0.7 * Math.min(1, (performance.now() - kb) / 600);
+          const kf = kb === undefined ? 1 : 0.3 + 0.7 * Math.min(1, (performance.now() - kb) / 950);
           return (v > 0 ? 1 + v * 0.5 : 1) * kf; // lit synapses thicken slightly
         }}
       />
