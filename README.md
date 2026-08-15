@@ -9,6 +9,7 @@ An agentic second brain that grows with you. Dump anything and an extraction age
 - [What it does](#what-it-does)
 - [The pipeline](#the-pipeline)
 - [Grows with you](#grows-with-you)
+- [Authentication](#authentication)
 - [Stack](#stack)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
@@ -94,10 +95,21 @@ Five feedback loops make every chat improve the next:
 4. **Continuity**: server-side chat history, digest nodes, and open loops with natural callbacks.
 5. **Feedback**: thumbs up/down on replies feeds consolidation, which infers the style correction you did not spell out.
 
+## Authentication
+
+Every page and API route requires a session. Auth is handled by better-auth on the same Neon Postgres: no external provider, and the `user`, `session`, `account`, and `verification` tables live next to the brain (created by `db/migrations/007_auth.sql`).
+
+- **Sign up** at `/signup` (name, email, password). The first account ever created is always the admin.
+- **Sign in** at `/login`; sign out from the account bubble in the chat header.
+- **Admin switch**: the account bubble (visible to the admin) contains "Allow new sign-ups". Off means `/signup` shows a closed notice and the API rejects new accounts with 403. The flag lives in `app_state['signup_enabled']` and defaults to enabled. A completely empty user table can always sign up, so the first account can never lock itself out.
+- The gate is two layers. `proxy.ts` (the Next.js 16 proxy, formerly middleware) does an optimistic session-cookie check and redirects pages to `/login` or 401s API calls. Every API route then re-verifies the session server-side with `requireUser()`, so an expired cookie cannot sneak through. Admin routes (`/api/admin/rebuild`, `/api/admin/export`) use `requireAdmin()`; `/api/admin/consolidate` stays guarded by `CRON_SECRET` for Vercel cron.
+- better-auth enforces an Origin check on auth POSTs, so set `BETTER_AUTH_URL` to the deployed origin.
+
 ## Stack
 
 - Next.js 16 (App Router, UI plus API routes), React 19, TypeScript.
 - Tailwind CSS and Ant Design 5 for the interface; react-force-graph-2d for the memory cosmos.
+- Authentication: better-auth with email and password, database sessions in Neon, Prisma adapter. First account is the admin; signups can be closed from the account menu.
 - Prisma ORM as the typed client for all queries. DDL stays SQL-owned (`db/migrations/*.sql`, auto-applied on dev start) because Prisma cannot manage pgvector column types; embeddings are written via raw SQL. After schema changes, mirror them in `prisma/schema.prisma` and run `npx prisma generate`.
 - Neon Postgres with pgvector: the memory graph (`dumps`, `nodes`, `edges`) plus semantic search over 1536-dimension embeddings (pgvector HNSW caps at 2000 dims).
 - Azure Foundry (OpenAI-compatible): one endpoint and one key serve both models. The chat/extraction model (default `FW-Kimi-K3`) and the embedding model (default `text-embedding-3-large`, 1536 dims) are read from the `AZURE_FOUNDRY_CHAT_MODEL` and `AZURE_FOUNDRY_EMBED_MODEL` env vars, so deployments can be swapped without a code change.
@@ -107,6 +119,7 @@ Five feedback loops make every chat improve the next:
 
 ~~~text
 app/                    Next.js App Router: page, layout, global CSS
+  login/ signup/        Auth pages (cosmos glass, standalone routes)
   api/                  API routes (see the API reference below)
 brain/                  Markdown skill files: the agent's behavior, editable live
   chat.md               Chat persona and remember-tool rules
@@ -115,16 +128,19 @@ brain/                  Markdown skill files: the agent's behavior, editable liv
   answer.md             Cited-answering rules
   digest.md             Conversation-to-digest condensation
   consolidate.md        Sleep-cycle review: profile promotion, merge judgment, insight
-components/             Chat.tsx, GraphView.tsx (the cosmos), AskBox.tsx, DumpBox.tsx, Providers.tsx
+components/             Chat.tsx, GraphView.tsx (the cosmos), UserMenu.tsx (account + signup switch), AskBox.tsx, DumpBox.tsx, Providers.tsx
 db/migrations/          SQL migrations, auto-applied on dev start, tracked in a _migrations table
 lib/
   agent.ts              Agent orchestration: chat, extraction, ask, consolidation
   graph.ts              Graph operations: recall, salience, digests, tasks, recap
   ai.ts                 Azure Foundry client, env-based model names, withRetry backoff
+  auth.ts               better-auth config, signup policy hook, requireUser/requireAdmin
+  auth-client.ts        Client auth (signUp/signIn/signOut/useSession)
   guard.ts              Content scan for memory-bound text (injection and secrets)
   db.ts                 Prisma client
+proxy.ts                The gate: optimistic session-cookie check, redirects to /login
 prisma/schema.prisma    Typed mirror of the SQL schema (embedding columns are Unsupported, raw SQL only)
-scripts/                migrate.mjs plus smoke tests (test-growth, test-memory-scan, test-repair, test-trivial-gate)
+scripts/                migrate.mjs plus smoke tests (test-auth, test-growth, test-memory-scan, test-repair, test-trivial-gate)
 ~~~
 
 ## Getting started
@@ -137,7 +153,7 @@ copy .env.example .env   # fill in the values below
 npm run dev              # applies any new db/migrations/*.sql, then starts Next.js
 ~~~
 
-Open http://localhost:3000. The memory cosmos renders behind the chat panel. The two model variables ship with working defaults in `.env.example`; change them only if your Azure deployments have different names.
+Open http://localhost:3000. You are redirected to `/login`; create the first account at `/signup` and it becomes the admin. The memory cosmos then renders behind the chat panel. The two model variables ship with working defaults in `.env.example`; change them only if your Azure deployments have different names.
 
 ## Environment variables
 
@@ -149,11 +165,17 @@ Open http://localhost:3000. The memory cosmos renders behind the chat panel. The
 | `AZURE_FOUNDRY_EMBED_MODEL` | no | Embedding model deployment. Default: `text-embedding-3-large` (1536 dims) |
 | `DATABASE_URL` | yes | Neon Postgres connection string. For serverless deploys use the pooler host so short-lived functions share connections; the direct host exhausts free-tier connection limits fast |
 | `CRON_SECRET` | production | Vercel sends it as `Authorization: Bearer <CRON_SECRET>` when calling the consolidation endpoint. Leave empty in local dev and the endpoint stays open |
+| `BETTER_AUTH_SECRET` | production | Session signing secret (32+ chars). Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `BETTER_AUTH_URL` | production | Base URL of the app, for example `https://your-app.vercel.app`. Auth POSTs are origin-checked against it |
 
 ## API reference
 
+All routes require a signed-in session except `/api/auth/*`, `GET /api/settings`, and `/api/admin/consolidate` (cron-secret). Admin routes additionally require the admin flag.
+
 | Route | Methods | What it does |
 | --- | --- | --- |
+| `/api/auth/*` | GET, POST | better-auth endpoints: email sign-up and sign-in, sign-out, session lookup |
+| `/api/settings` | GET, POST | GET is public: `{ signupEnabled }`. POST flips the signup switch, admin only |
 | `/api/chat` | POST | Streamed chat with profile, open loops, salience-ranked recall, and silent memory writes |
 | `/api/chat/history` | GET | Rehydrate the current session's thread and title on page load |
 | `/api/dump` | POST | Extract nodes, edges, and updates from raw text into the graph |
@@ -187,11 +209,18 @@ node scripts/test-repair.mjs        # repairToolArguments: fixing malformed tool
 node scripts/test-trivial-gate.mjs  # the trivial-prompt gate regex for memory writes
 ~~~
 
+The auth test is self-contained: it spins up its own dev server on :3100 against the live DB, then deletes its test users afterwards.
+
+~~~bash
+node scripts/test-auth.mjs          # the auth gate end to end: redirects, 401s, first-user admin, the signup switch
+~~~
+
 ## Deployment
 
 Deploys target Vercel.
 
 - `vercel.json` registers a nightly cron at 03:00 that calls `/api/admin/consolidate` as a dry run. Set `CRON_SECRET` in production; Vercel includes it automatically as a bearer token.
+- Set `BETTER_AUTH_SECRET` and `BETTER_AUTH_URL` (your production origin) in the Vercel project settings. better-auth signs session cookies with the secret and origin-checks auth POSTs against the URL.
 - `npm run build` sets `DIST_DIR=.next-build`, which `next.config.mjs` honors as `distDir`, so a production build never wipes the running dev server's `.next` chunks.
 - Use the Neon pooler host in `DATABASE_URL` so serverless functions share connections.
 - Set `AZURE_FOUNDRY_CHAT_MODEL` and `AZURE_FOUNDRY_EMBED_MODEL` in the Vercel project settings if your production deployments differ from the defaults.

@@ -6,6 +6,7 @@ import {
   extractFromStretch,
   titleForSession,
 } from "@/lib/agent";
+import { requireUser } from "@/lib/auth";
 import {
   markRecallUsed,
   currentSessionId,
@@ -22,6 +23,9 @@ import {
 const DIGEST_EVERY = 12;
 
 export async function POST(req: Request) {
+  const user = await requireUser();
+  if (!user) return Response.json({ error: "unauthorized" }, { status: 401 });
+
   let body: { message?: unknown };
   try {
     body = await req.json();

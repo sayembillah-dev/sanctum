@@ -1,5 +1,6 @@
 import Chat from "@/components/Chat";
 import GraphView from "@/components/GraphView";
+import UserMenu from "@/components/UserMenu";
 
 export default function Home() {
   return (
@@ -27,6 +28,7 @@ export default function Home() {
             <span className="live-dot" />
             LIVE
           </span>
+          <UserMenu />
         </header>
         <Chat />
       </aside>

@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db";
 import { runExtraction } from "@/lib/agent";
+import { requireAdmin } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -9,8 +10,13 @@ export const maxDuration = 300;
  * Dumps are the source of truth; the graph is a derived view.
  * The pinned profile node is re-seeded by the first extraction.
  * Dev/prototype tool: heals graphs built before dedup + linking were fixed.
+ *
+ * Auth: admin session required (destructive — truncates the graph).
  */
 export async function POST() {
+  if (!(await requireAdmin())) {
+    return Response.json({ error: "admin only" }, { status: 403 });
+  }
   const dumps = await prisma.dump.findMany({
     orderBy: { created_at: "asc" },
     select: { raw_text: true },

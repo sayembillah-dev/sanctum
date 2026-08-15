@@ -1,4 +1,5 @@
 import { currentSessionId, getSessionTitleInfo, recentChatMessages } from "@/lib/graph";
+import { requireUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic"; // never cache — the thread is live
 
@@ -6,6 +7,8 @@ export const dynamic = "force-dynamic"; // never cache — the thread is live
  *  Conversation persistence: a refresh no longer wipes the chat.
  *  Also returns the session title (X5 two-stage titles). */
 export async function GET() {
+  const user = await requireUser();
+  if (!user) return Response.json({ error: "unauthorized" }, { status: 401 });
   const sessionId = await currentSessionId();
   const [messages, info] = await Promise.all([
     recentChatMessages(sessionId, 100),
