@@ -301,10 +301,11 @@ export default function GraphView() {
           // 🔥 recall pulse — fading white ring + brightened halo for ~3.5s
           // recall glow: neuron burns brighter & bigger while in use, then cools
           const t0 = pulses.current.get(node.id);
-          const boost =
+          const raw =
             t0 !== undefined
               ? Math.max(0, 1 - (performance.now() - t0) / PULSE_MS)
               : 0;
+          const boost = raw * raw; // eased fade — soft onset, long silky tail
           if (t0 !== undefined && performance.now() - t0 >= PULSE_MS) {
             pulses.current.delete(node.id);
           }
@@ -312,14 +313,14 @@ export default function GraphView() {
 
           // soft outer halo — swells while glowing; the sun radiates wider & warmer
           ctx.beginPath();
-          ctx.arc(node.x, node.y, rr * ((isSun ? 3.1 : 2.2) + 1.6 * boost), 0, 2 * Math.PI);
-          ctx.fillStyle = color + (boost > 0 ? "3d" : isSun ? "2e" : "1a");
+          ctx.arc(node.x, node.y, rr * ((isSun ? 2.4 : 1.9) + 0.9 * boost), 0, 2 * Math.PI);
+          ctx.fillStyle = color + (boost > 0 ? "1c" : isSun ? "12" : "0b");
           ctx.fill();
 
           // neuron body — hot core cooling to type color, with neon glow
           ctx.save();
-          ctx.shadowColor = boost > 0.05 ? "#ffffff" : color;
-          ctx.shadowBlur = (isSun ? 26 : 16) + 30 * boost;
+          ctx.shadowColor = color;
+          ctx.shadowBlur = (isSun ? 10 : 6) + 12 * boost;
           const g = ctx.createRadialGradient(
             node.x - rr * 0.35,
             node.y - rr * 0.35,
