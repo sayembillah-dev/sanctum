@@ -1,0 +1,71 @@
+// Sanctum — Prisma schema.
+// NOTE: DDL stays SQL-owned (db/migrations/*.sql, auto-applied by scripts/migrate.mjs)
+// because Prisma can't manage pgvector column types. This schema mirrors the SQL
+// so the client is fully typed; embedding columns are Unsupported and written
+// via raw SQL only. After editing, run: npx prisma generate
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Dump {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  raw_text   String
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  edges      Edge[]
+
+  @@map("dumps")
+}
+
+model Node {
+  id                String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type              String
+  name              String
+  attrs             Json                    @default("{}")
+  embedding         Unsupported("vector(1536)")?
+  created_at        DateTime                @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime                @default(now()) @db.Timestamptz(6)
+  valid_to          DateTime?               @db.Date
+  // ── Grows-With-You: salience (003) ──
+  mention_count     Int                     @default(1) // strengthened every time extraction re-encounters this entity
+  last_recalled_at  DateTime?               @db.Timestamptz(6)
+  recall_used_count Int                     @default(0) // how often a reply actually cited this memory
+  pinned            Boolean                 @default(false) // the user's profile node — never decays, always in context
+  outgoing          Edge[]                  @relation("src")
+  incoming          Edge[]                  @relation("dst")
+
+  @@map("nodes")
+}
+
+model Edge {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  src_id         String    @db.Uuid
+  dst_id         String    @db.Uuid
+  type           String
+  attrs          Json      @default("{}")
+  said_on        DateTime? @db.Date
+  valid_from     DateTime? @db.Date
+  valid_to       DateTime? @db.Date
+  source_dump_id String?   @db.Uuid
+  created_at     DateTime  @default(now()) @db.Timestamptz(6)
+  src            Node      @relation("src", fields: [src_id], references: [id], onDelete: Cascade)
+  dst            Node      @relation("dst", fields: [dst_id], references: [id], onDelete: Cascade)
+  dump           Dump?     @relation(fields: [source_dump_id], references: [id])
+
+  @@map("edges")
+}
+
+model Feedback {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  rating        Int      @db.SmallInt // +1 / -1
+  user_msg      String
+  assistant_msg String
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("feedback")
+}
