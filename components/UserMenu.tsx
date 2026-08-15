@@ -4,12 +4,15 @@ import { useEffect, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 
 /** Account bubble in the chat header: glass modal with the signed-in profile,
- *  the admin-only "allow new sign-ups" switch, and sign out. */
+ *  the admin-only "allow new sign-ups" switch, admin data exports (Obsidian
+ *  vault zip / full JSON backup), and sign out. */
 export default function UserMenu() {
   const { data: session, isPending } = authClient.useSession();
   const [open, setOpen] = useState(false);
   const [signupEnabled, setSignupEnabled] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState<"vault" | "json" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   const user = session?.user as { name?: string; email?: string; isAdmin?: boolean } | undefined;
   const isAdmin = user?.isAdmin === true;
@@ -36,6 +39,30 @@ export default function UserMenu() {
       setSignupEnabled(!next);
     } finally {
       setSaving(false);
+    }
+  }
+
+  /** Downloads an admin export via fetch + object URL so we can show a busy
+   *  state (the vault build can take a few seconds) and surface errors inline.
+   *  The routes send Content-Disposition: attachment, so this never navigates. */
+  async function downloadExport(kind: "vault" | "json") {
+    setExporting(kind);
+    setExportError(null);
+    try {
+      const url = kind === "vault" ? "/api/admin/export?format=vault" : "/api/admin/export";
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`Export failed (HTTP ${r.status})`);
+      const blob = await r.blob();
+      const m = /filename="?([^";]+)"?/.exec(r.headers.get("Content-Disposition") || "");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = m?.[1] || (kind === "vault" ? "sanctum-vault.zip" : "sanctum-export.json");
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : "Export failed");
+    } finally {
+      setExporting(null);
     }
   }
 
@@ -107,6 +134,32 @@ export default function UserMenu() {
                       }`}
                     />
                   </button>
+                </div>
+
+                <div className="mt-4 border-t border-white/[0.06] pt-4">
+                  <p className="text-sm text-slate-200">Export data</p>
+                  <p className="mt-0.5 text-[11px] leading-snug text-slate-500">
+                    Vault = Obsidian-ready markdown notes. JSON = full raw backup.
+                  </p>
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <button
+                      disabled={exporting !== null}
+                      onClick={() => downloadExport("vault")}
+                      className="rounded-xl border border-white/10 bg-white/[0.04] py-1.5 text-xs text-slate-300 transition hover:border-indigo-400/40 hover:bg-indigo-500/10 hover:text-indigo-200 disabled:opacity-50"
+                    >
+                      {exporting === "vault" ? "Building..." : "Vault (.zip)"}
+                    </button>
+                    <button
+                      disabled={exporting !== null}
+                      onClick={() => downloadExport("json")}
+                      className="rounded-xl border border-white/10 bg-white/[0.04] py-1.5 text-xs text-slate-300 transition hover:border-indigo-400/40 hover:bg-indigo-500/10 hover:text-indigo-200 disabled:opacity-50"
+                    >
+                      {exporting === "json" ? "Exporting..." : "JSON"}
+                    </button>
+                  </div>
+                  {exportError && (
+                    <p className="mt-2 text-[11px] leading-snug text-rose-300">{exportError}</p>
+                  )}
                 </div>
               </div>
             )}
