@@ -888,23 +888,44 @@ export async function recentNegativeFeedback(take = 10) {
   });
 }
 
-/** Full live-graph snapshot for the neuron view (force-graph wants { nodes, links }). */
-export async function graphSnapshot() {
+/** Full live-graph snapshot for the neuron view (force-graph wants { nodes, links }).
+ *  🕰️ Time-travel: pass asOf (YYYY-MM-DD) for the graph as it was at the end of
+ *  that day — later arrivals vanish, since-forgotten nodes return. The bi-temporal
+ *  columns (created_at, valid_from/valid_to) already store this history, so the
+ *  feature is pure read-path. */
+export async function graphSnapshot(asOf?: string) {
+  const day = asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? asOf : null;
+  const endOfDay = day ? new Date(`${day}T23:59:59.999`) : null;
   // Conversation digests stay in recall but never render in the cosmos
   const nodes = await prisma.node.findMany({
-    where: { valid_to: null, type: { not: "Conversation" } },
+    where: day
+      ? {
+          type: { not: "Conversation" },
+          created_at: { lte: endOfDay! },
+          OR: [{ valid_to: null }, { valid_to: { gt: asDate(day) } }],
+        }
+      : { valid_to: null, type: { not: "Conversation" } },
     orderBy: { created_at: "asc" },
-    select: { id: true, type: true, name: true, pinned: true, mention_count: true },
+    select: { id: true, type: true, name: true, pinned: true, mention_count: true, created_at: true },
   });
   const ids = new Set(nodes.map((n) => n.id));
   const edges = (
     await prisma.edge.findMany({
-      where: { valid_to: null },
+      where: day
+        ? {
+            created_at: { lte: endOfDay! },
+            AND: [
+              { OR: [{ valid_from: null }, { valid_from: { lte: asDate(day) } }] },
+              { OR: [{ valid_to: null }, { valid_to: { gt: asDate(day) } }] },
+            ],
+          }
+        : { valid_to: null },
       select: { src_id: true, dst_id: true, type: true },
     })
   ).filter((e) => ids.has(e.src_id) && ids.has(e.dst_id));
   return {
-    nodes,
+    // `day` feeds the time-travel slider's earliest date
+    nodes: nodes.map((n) => ({ ...n, day: n.created_at.toISOString().slice(0, 10) })),
     links: edges.map((e) => ({ source: e.src_id, target: e.dst_id, type: e.type })),
   };
 }

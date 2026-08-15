@@ -32,6 +32,7 @@ type GNode = {
   name: string;
   pinned?: boolean;
   mention_count?: number;
+  day?: string; // created date (YYYY-MM-DD) — feeds the time-travel slider
   x?: number;
   y?: number;
 };
@@ -58,6 +59,24 @@ export default function GraphView() {
   const prevCount = useRef(0);
   const dirtyUntil = useRef(0);
   const pulses = useRef<Map<string, number>>(new Map());
+
+  // ── 🕰️ time-travel ───────────────────────────────────────────────────
+  // asOf = null → live graph; a date → the cosmos as it was that day.
+  const [asOf, setAsOf] = useState<string | null>(null);
+  const asOfRef = useRef<string | null>(null);
+  const travelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firstDayEver = useRef<string | null>(null); // earliest node day ever seen (stable slider range)
+  const today = new Date().toLocaleDateString("en-CA");
+  const dayToInt = (d: string) => Math.round(Date.parse(`${d}T00:00:00Z`) / 864e5);
+  const intToDay = (i: number) => new Date(i * 864e5).toISOString().slice(0, 10);
+
+  const travel = (d: string | null) => {
+    asOfRef.current = d;
+    setAsOf(d);
+    // debounce — dragging the slider fires a stream of changes
+    if (travelTimer.current) clearTimeout(travelTimer.current);
+    travelTimer.current = setTimeout(() => load(), 180);
+  };
 
   // ── node inspector ─────────────────────────────────────────────────────
   type NodeDetail = {
@@ -141,8 +160,14 @@ export default function GraphView() {
   // ── data loading (dirty-window polling after activity) ───────────────────
   const load = async () => {
     try {
-      const r = await fetch("/api/graph", { cache: "no-store" });
+      const q = asOfRef.current ? `?as_of=${asOfRef.current}` : "";
+      const r = await fetch(`/api/graph${q}`, { cache: "no-store" });
       const d = (await r.json()) as GData;
+      for (const n of d.nodes) {
+        if (n.day && (!firstDayEver.current || n.day < firstDayEver.current)) {
+          firstDayEver.current = n.day; // slider range never shrinks while traveling
+        }
+      }
       const nextSig =
         d.nodes
           .map((n) => `${n.id}:${n.name}:${n.type}:${n.pinned ? 1 : 0}:${n.mention_count ?? 0}`)
@@ -302,6 +327,42 @@ export default function GraphView() {
       <div className="pointer-events-none absolute bottom-3 left-3 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] tracking-wide text-slate-300/80 backdrop-blur">
         {data.nodes.length} neurons · {data.links.length} synapses
       </div>
+
+      {/* 🕰️ time-travel — scrub the cosmos back through its history */}
+      {firstDayEver.current && firstDayEver.current < today && (
+        <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur">
+          <span className="text-[11px]" title="Time-travel: the graph as it was">
+            🕰️
+          </span>
+          <input
+            type="range"
+            aria-label="Travel to a past day"
+            className="h-1 w-40 cursor-pointer accent-indigo-400"
+            min={dayToInt(firstDayEver.current)}
+            max={dayToInt(today)}
+            value={dayToInt(asOf ?? today)}
+            onChange={(e) => {
+              const d = intToDay(Number(e.target.value));
+              travel(d === today ? null : d);
+            }}
+          />
+          <span
+            className={`min-w-[4.5rem] text-center text-[11px] tabular-nums ${
+              asOf ? "text-amber-300" : "text-slate-400"
+            }`}
+          >
+            {asOf ?? "now"}
+          </span>
+          {asOf && (
+            <button
+              onClick={() => travel(null)}
+              className="rounded-full border border-amber-300/30 px-2 py-0.5 text-[10px] text-amber-300 transition hover:bg-amber-400/10"
+            >
+              back to now
+            </button>
+          )}
+        </div>
+      )}
 
       {/* ── node inspector — click a neuron ── */}
       {selected && (
