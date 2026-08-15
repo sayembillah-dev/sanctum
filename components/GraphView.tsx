@@ -90,7 +90,7 @@ export default function GraphView() {
   const dirtyUntil = useRef(0);
   const pulses = useRef<Map<string, number>>(new Map());
   const births = useRef<Map<string, number>>(new Map()); // node id → first-seen ts (bloom-in)
-  const pops = useRef(new Map<string, { ax: number; ay: number; ang: number; t0: number }>()); // pop-out tweens
+  const pops = useRef(new Map<string, { ax: number; ay: number; ang: number; t0: number; tx?: number; ty?: number }>()); // pop-out tweens (tx/ty = settled destination when known)
 
   // ── 🕰️ timelapse — serial-based, not time-based ──────────────────────
   // The cosmos replays in the order neurons were born (the snapshot arrives
@@ -100,6 +100,8 @@ export default function GraphView() {
   const [playing, setPlaying] = useState(false);
   const playRef = useRef<number | null>(null); // rAF handle
   const prevVisible = useRef<Set<string>>(new Set());
+  const prevLinkKeys = useRef<Set<string>>(new Set()); // visible synapses last frame (grow-in tracking)
+  const linkBirths = useRef<Map<string, number>>(new Map()); // "a|b" → first-visible ts
 
   const stopPlay = () => {
     if (playRef.current !== null) cancelAnimationFrame(playRef.current);
@@ -209,10 +211,14 @@ export default function GraphView() {
   const view = useMemo<GData>(() => {
     const nodes = cut === null ? data.nodes : data.nodes.slice(0, cut);
     const visible = new Set(nodes.map((n) => n.id));
-    if (prevVisible.current.size > 0) {
-      const now = performance.now();
+    const now = performance.now();
+    // The timelapse OWNS its entrances: every newly revealed neuron kicks in
+    // from a visible parent — even though it already holds a settled position
+    // from the live layout (that spot becomes the tween's destination, so the
+    // pop reads as growth, not a teleport). Live-path entries are load()'s job.
+    if (cut !== null) {
       for (const n of nodes) {
-        if (prevVisible.current.has(n.id) || n.x !== undefined) continue;
+        if (prevVisible.current.has(n.id)) continue;
         births.current.set(n.id, now);
         pulses.current.set(n.id, now);
         const nb = data.links.find((l) => {
@@ -223,25 +229,34 @@ export default function GraphView() {
         const anchor = nb
           ? nodes.find((m) => m.id === (idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source)))
           : undefined;
-        if (anchor?.x !== undefined) {
-          // 🎆 pop out FROM the parent (Obsidian timelapse feel): spawn pinned at
-          // its exact position, then a per-frame tween eases it outward (d3's
-          // velocity decay eats plain kicks in ~5 ticks — too fast to read as motion)
-          n.x = anchor.x;
+        if (anchor && Number.isFinite(anchor.x)) {
+          // 🎆 spawn pinned AT the parent; the per-frame tween eases it to its
+          // settled spot with an easeOutBack overshoot, then releases to physics
+          const settled =
+            Number.isFinite(n.x) && Number.isFinite(n.y) ? { tx: n.x as number, ty: n.y as number } : {};
+          n.x = anchor.x as number;
           n.y = anchor.y ?? 0;
           n.fx = n.x;
           n.fy = n.y;
-          pops.current.set(n.id, { ax: n.x, ay: n.y, ang: Math.random() * Math.PI * 2, t0: now });
+          pops.current.set(n.id, { ax: n.x, ay: n.y, ang: Math.random() * Math.PI * 2, t0: now, ...settled });
         }
+        // no visible parent (first neuron / island): births above blooms it in place
+      }
+      // synapses grow in alongside their neuron — track first visibility per link
+      for (const l of data.links) {
+        const a = idOf(l.source);
+        const b = idOf(l.target);
+        if (!visible.has(a) || !visible.has(b)) continue;
+        const k = `${a}|${b}`;
+        if (!prevLinkKeys.current.has(k)) linkBirths.current.set(k, now);
       }
       // no reheat here — reheating on every entry pins the sim at full boil;
       // the running sim settles released nodes gently on its own
     }
     prevVisible.current = visible;
-    return {
-      nodes,
-      links: data.links.filter((l) => visible.has(idOf(l.source)) && visible.has(idOf(l.target))),
-    };
+    const links = data.links.filter((l) => visible.has(idOf(l.source)) && visible.has(idOf(l.target)));
+    prevLinkKeys.current = new Set(links.map((l) => `${idOf(l.source)}|${idOf(l.target)}`));
+    return { nodes, links };
   }, [data, cut]);
 
   const radiusOf = (n: GNode) => {
@@ -417,10 +432,13 @@ export default function GraphView() {
           const pop = pops.current.get(n.id);
           if (pop) {
             const p = Math.min(1, (performance.now() - pop.t0) / 700);
-            const e = 1 + 2.70158 * Math.pow(p - 1, 3) + 1.70158 * Math.pow(p - 1, 2);
-            const dist = 90 * e;
-            n.x = n.fx = pop.ax + Math.cos(pop.ang) * dist;
-            n.y = n.fy = pop.ay + Math.sin(pop.ang) * dist;
+            const e = 1 + 2.70158 * Math.pow(p - 1, 3) + 1.70158 * Math.pow(p - 1, 2); // easeOutBack (overshoot)
+            // known destination (timelapse): lerp parent → settled spot;
+            // fresh live entry: legacy 90px ray in a random direction
+            const tx = pop.tx ?? pop.ax + Math.cos(pop.ang) * 90;
+            const ty = pop.ty ?? pop.ay + Math.sin(pop.ang) * 90;
+            n.x = n.fx = pop.ax + (tx - pop.ax) * e;
+            n.y = n.fy = pop.ay + (ty - pop.ay) * e;
             if (p >= 1) {
               delete n.fx; // release → force layout takes over
               delete n.fy;
@@ -446,9 +464,11 @@ export default function GraphView() {
           const birthF = tB === undefined ? 1 : Math.min(1, (performance.now() - tB) / 900);
           if (birthF >= 1 && tB !== undefined) births.current.delete(n.id);
           const eB = 1 - Math.pow(1 - birthF, 3);
+          // pop kick: easeOutBack overshoot on the RADIUS (alpha stays easeOutCubic)
+          const eK = 1 + 2.70158 * Math.pow(birthF - 1, 3) + 1.70158 * Math.pow(birthF - 1, 2);
 
           // halo — radial gradient, fades to nothing (no hard edge)
-          const haloR = r * (2.1 + 1.2 * boost) * eB;
+          const haloR = r * (2.1 + 1.2 * boost) * eK;
           const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
           g.addColorStop(0, `rgba(${cr},${cg},${cb},${(mix(boost > 0 ? 0.19 : 0.1, 0.028, dimF) * eB).toFixed(3)})`);
           g.addColorStop(1, color + "00");
@@ -459,7 +479,7 @@ export default function GraphView() {
 
           // core
           ctx.beginPath();
-          ctx.arc(n.x, n.y, r * (1 + 0.25 * boost) * eB, 0, Math.PI * 2);
+          ctx.arc(n.x, n.y, r * (1 + 0.25 * boost) * eK, 0, Math.PI * 2);
           ctx.fillStyle = `rgba(${cr},${cg},${cb},${(mix(1, 0.14, dimF) * eB).toFixed(3)})`;
           ctx.fill();
 
@@ -487,17 +507,24 @@ export default function GraphView() {
           const b = idOf(l.target);
           const target = hover === null ? 0 : a === hover || b === hover ? 1 : -1;
           const v = lerpTo(linkFx.current, `${a}|${b}`, target, 0.16);
+          // grow-in: synapses revealed by the timelapse fade/widen over ~0.6s
+          const kb = linkBirths.current.get(`${a}|${b}`);
+          const kf = kb === undefined ? 1 : Math.min(1, (performance.now() - kb) / 600);
+          if (kb !== undefined && kf >= 1) linkBirths.current.delete(`${a}|${b}`);
           return v >= 0
             ? // ease slate → lit indigo
               `rgba(${Math.round(mix(148, 165, v))},${Math.round(mix(163, 180, v))},${Math.round(
                 mix(184, 252, v)
-              )},${mix(0.22, 0.6, v).toFixed(3)})`
+              )},${(mix(0.22, 0.6, v) * kf).toFixed(3)})`
             : // ease toward background
-              `rgba(148,163,184,${mix(0.22, 0.05, -v).toFixed(3)})`;
+              `rgba(148,163,184,${(mix(0.22, 0.05, -v) * kf).toFixed(3)})`;
         }}
         linkWidth={(l: any) => {
-          const v = linkFx.current.get(`${idOf(l.source)}|${idOf(l.target)}`) ?? 0;
-          return v > 0 ? 1 + v * 0.5 : 1; // lit synapses thicken slightly
+          const k = `${idOf(l.source)}|${idOf(l.target)}`;
+          const v = linkFx.current.get(k) ?? 0;
+          const kb = linkBirths.current.get(k);
+          const kf = kb === undefined ? 1 : 0.3 + 0.7 * Math.min(1, (performance.now() - kb) / 600);
+          return (v > 0 ? 1 + v * 0.5 : 1) * kf; // lit synapses thicken slightly
         }}
       />
 
