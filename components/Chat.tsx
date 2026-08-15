@@ -81,7 +81,7 @@ export default function Chat() {
     if (!confirmClear) return setConfirmClear(true);
     // 🌙 session ended — the server crystallizes its transcript into a digest
     // node and rotates to a fresh session (fire-and-forget)
-    fetch("/api/conversations/digest", { method: "POST" })
+    fetch("/api/conversations/digest", { method: "POST", keepalive: true })
       .then(() => window.dispatchEvent(new Event("sanctum:dirty")))
       .catch(() => {});
     setMessages([]);

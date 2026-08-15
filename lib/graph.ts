@@ -61,7 +61,13 @@ export async function persistExtraction(
   nodes: ExtractedNode[],
   edges: ExtractedEdge[],
   known: { id: string; type: string; name: string }[]
-): Promise<{ dumpId: string; created: string[]; reused: string[]; edgesCreated: number }> {
+): Promise<{
+  dumpId: string;
+  created: string[];
+  reused: string[];
+  edgesCreated: number;
+  edgesDropped: { src: string; dst: string; type: string; reason: string }[];
+}> {
   const idByName = new Map<string, string>();
   const setKeys = (name: string, id: string) => {
     idByName.set(name.trim().toLowerCase(), id);
@@ -253,13 +259,25 @@ export async function persistExtraction(
 
       // Edges: endpoints were batch-resolved pre-tx (findNode stays as a safety
       // net that should never fire); skip self-loops; race-safe ON CONFLICT.
+      // Dropped edges are COLLECTED, never silently swallowed — a dropped edge
+      // is a fact the user told us that we're about to lose. Callers surface
+      // them (chat slow path: the model gets a fix-it tool result and retries).
       let edgesCreated = 0;
+      const edgesDropped: { src: string; dst: string; type: string; reason: string }[] = [];
       for (const e of edges) {
         let srcId = idByName.get(e.src.trim().toLowerCase()) ?? idByName.get(normOf(e.src));
         let dstId = idByName.get(e.dst.trim().toLowerCase()) ?? idByName.get(normOf(e.dst));
         if (!srcId) srcId = (await findNode(e.src)) ?? undefined;
         if (!dstId) dstId = (await findNode(e.dst)) ?? undefined;
-        if (!srcId || !dstId || srcId === dstId) continue; // unknown reference or self-loop
+        if (!srcId || !dstId || srcId === dstId) {
+          edgesDropped.push({
+            src: e.src,
+            dst: e.dst,
+            type: e.type,
+            reason: srcId && srcId === dstId ? "self-loop" : "unknown endpoint",
+          });
+          continue;
+        }
         const ins = await tx.$queryRaw<{ id: string }[]>`
           insert into edges (src_id, dst_id, type, said_on, valid_from, source_dump_id)
           values (${srcId}::uuid, ${dstId}::uuid, ${e.type}, ${e.said_on ?? null}::date, ${e.said_on ?? null}::date, ${dump.id}::uuid)
@@ -278,7 +296,10 @@ export async function persistExtraction(
         }
       }
 
-      return { dumpId: dump.id, created, reused, edgesCreated };
+      if (edgesDropped.length) {
+        console.warn("🕳️ extraction dropped edge(s):", JSON.stringify(edgesDropped));
+      }
+      return { dumpId: dump.id, created, reused, edgesCreated, edgesDropped };
     },
     { timeout: 15000 } // Neon cold starts can be slow; HTTP work stays outside the tx
   );

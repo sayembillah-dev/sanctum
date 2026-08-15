@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import {
   chat,
   continueChat,
@@ -21,6 +22,43 @@ import {
 // Sourced from the DB now — client retries or clear-chat can't shift or
 // double-fire it, and the digest stretch comes from the server-side transcript.
 const DIGEST_EVERY = 12;
+
+/** Post-response work with a delivery guarantee. after() keeps a serverless
+ *  function alive until the callback settles — a bare fire-and-forget promise
+ *  can be frozen mid-write the moment the stream closes (a silently lost
+ *  memory). Falls back to plain fire-and-forget outside a request context. */
+function defer(fn: () => Promise<void>) {
+  try {
+    after(fn);
+  } catch {
+    void fn();
+  }
+}
+
+/** Queued remember-save with ONE retry: by the time these drain, the reply has
+ *  already streamed, so model self-correction is impossible — delivery is the
+ *  only guarantee left. Dropped edges are logged loudly (they're lost facts). */
+async function saveRemembered(message: string, argsJson: string, tag: string) {
+  let r = await applyRemembered(message, argsJson).catch((e) => ({
+    ok: false as const,
+    error: e instanceof Error ? e.message : String(e),
+  }));
+  if (!r.ok) {
+    await new Promise((s) => setTimeout(s, 500));
+    r = await applyRemembered(message, argsJson).catch((e) => ({
+      ok: false as const,
+      error: e instanceof Error ? e.message : String(e),
+    }));
+  }
+  if (r.ok) {
+    console.log(`🧠 remember${tag}:`, JSON.stringify(r));
+    if (r.edgesDropped.length) {
+      console.warn(`🧠 remember${tag} dropped edge(s):`, JSON.stringify(r.edgesDropped));
+    }
+  } else {
+    console.error(`🧠 remember${tag} failed (after retry):`, r.error);
+  }
+}
 
 export async function POST(req: Request) {
   const user = await requireUser();
@@ -57,6 +95,10 @@ export async function POST(req: Request) {
   // Tool-call fragments stream in piecemeal, addressed by index — accumulate
   // them here. They are NEVER enqueued: the user sees only the reply text.
   const toolCalls: Record<number, { id: string; name: string; arguments: string }> = {};
+  // Post-stream write queue: drained IN ORDER by a single after() callback in
+  // the stream's finally block — writes can't be frozen mid-flight, and the
+  // digest cadence always reads a fully persisted transcript.
+  const postWork: (() => Promise<void>)[] = [];
 
   return new Response(
     new ReadableStream({
@@ -78,7 +120,8 @@ export async function POST(req: Request) {
 
           // 🧠 MemGPT loop — the model decided mid-reply what's worth remembering.
           // The gating cost rode on the reply call, so persistence is free of
-          // extra LLM calls. Fire-and-forget: the reply NEVER waits for the write.
+          // extra LLM calls. Saves are queued (postWork) for guaranteed
+          // post-response delivery: the reply NEVER waits for the write.
           const calls = Object.keys(toolCalls)
             .map(Number)
             .sort((a, b) => a - b)
@@ -90,6 +133,7 @@ export async function POST(req: Request) {
           // the model believes succeeded is a silently lost memory).
           if (!reply.trim() && calls.length) {
             const results: string[] = [];
+            let anyDropped = false;
             for (const c of calls) {
               if (c.name !== "remember") {
                 results.push(`Unknown tool '${c.name}'.`);
@@ -98,13 +142,22 @@ export async function POST(req: Request) {
               try {
                 const r = await applyRemembered(message, c.arguments);
                 console.log("🧠 remember:", JSON.stringify(r));
-                results.push(
-                  r.ok
-                    ? r.unchanged
-                      ? "✓ Already known — this exact memory exists, nothing changed. Don't save it again in future replies."
-                      : "✓ Saved to long-term memory."
-                    : `✗ Memory save failed: ${r.error}. Fix the arguments and retry once, or skip saving.`
-                );
+                let msg = r.ok
+                  ? r.unchanged
+                    ? "✓ Already known — this exact memory exists, nothing changed. Don't save it again in future replies."
+                    : "✓ Saved to long-term memory."
+                  : `✗ Memory save failed: ${r.error}. Fix the arguments and retry once, or skip saving.`;
+                // A dropped edge is a fact about to be lost — tell the model
+                // exactly what's missing so the retry can save it for real.
+                if (r.ok && r.edgesDropped.length) {
+                  anyDropped = true;
+                  msg += ` ⚠️ ${r.edgesDropped.length} edge(s) dropped — unknown node(s): ${r.edgesDropped
+                    .map((d) => `${d.src} -${d.type}-> ${d.dst}`)
+                    .join(
+                      "; "
+                    )}. Declare the missing endpoint(s) in nodes[] and call remember once more.`;
+                }
+                results.push(msg);
               } catch (e) {
                 console.error("🧠 remember failed:", e);
                 results.push(
@@ -114,9 +167,9 @@ export async function POST(req: Request) {
                 );
               }
             }
-            // One-shot retry: re-attach the remember tool only when a save
-            // failed. No phase 3 exists, so this cannot recurse.
-            const anyFail = results.some((r) => r.startsWith("✗"));
+            // One-shot retry: re-attach the remember tool when a save failed
+            // OR edges were dropped. No phase 3 exists, so this cannot recurse.
+            const anyFail = results.some((r) => r.startsWith("✗")) || anyDropped;
             const followup = await continueChat(requestMessages, calls, results, anyFail);
             const retryCalls: Record<number, { id: string; name: string; arguments: string }> = {};
             for await (const chunk of followup) {
@@ -135,7 +188,7 @@ export async function POST(req: Request) {
                 }
               }
             }
-            // Retry saves persist fire-and-forget — the loop ends here.
+            // Retry saves ride the post-stream queue — the loop ends here.
             if (anyFail) {
               const retries = Object.keys(retryCalls)
                 .map(Number)
@@ -143,18 +196,14 @@ export async function POST(req: Request) {
                 .map((i) => retryCalls[i])
                 .filter((c) => c.name === "remember");
               for (const c of retries) {
-                applyRemembered(message, c.arguments)
-                  .then((r) => console.log("🧠 remember (retry):", JSON.stringify(r)))
-                  .catch((e) => console.error("🧠 remember (retry) failed:", e));
+                postWork.push(() => saveRemembered(message, c.arguments, " (retry)"));
               }
             }
           } else {
-            // Fast path: the reply already streamed — fire-and-forget, the
-            // reply NEVER waits for the write.
+            // Fast path: the reply already streamed — queue the saves; the
+            // reply NEVER waits for the write (after() delivery + one retry).
             for (const c of calls.filter((c) => c.name === "remember")) {
-              applyRemembered(message, c.arguments)
-                .then((r) => console.log("🧠 remember:", JSON.stringify(r)))
-                .catch((e) => console.error("🧠 remember failed:", e));
+              postWork.push(() => saveRemembered(message, c.arguments, ""));
             }
           }
         } catch (e) {
@@ -168,46 +217,58 @@ export async function POST(req: Request) {
           }
         } finally {
           controller.close();
-          // Persist the assistant turn (even a partial one) — history, cadence
-          // and digests all read from the DB transcript now.
-          await appendChatMessage(sessionId, "assistant", reply).catch(() => {});
-          // 🌱 Growth bookkeeping — fire-and-forget, never delays the reply:
-          // recalled nodes the reply actually cited get their usage count bumped
-          const used = recalled.filter((id) => {
-            const name = recalledNames[id];
-            return name && reply.toLowerCase().includes(name.toLowerCase());
-          });
-          if (used.length) markRecallUsed(used).catch(() => {});
-          // Every 12 persisted messages: crystallize the recent stretch into a
-          // digest node + safety-net extraction over it (catches lasting facts
-          // the in-reply remember tool didn't fire on).
-          const count = await sessionMessageCount(sessionId).catch(() => 0);
-          // 🏷️ X5 stage 2: once the session has substance (6 msgs, then each
-          // digest boundary while still untitled-by-LLM), upgrade the title.
-          // Provenance guard: never overwrite an 'llm' or 'user' title.
-          if (count === 6 || (count > 6 && count % DIGEST_EVERY === 0)) {
-            (async () => {
-              const info = await getSessionTitleInfo(sessionId);
-              if (!info || info.title_source !== "derived") return;
-              const t = await titleForSession(await recentChatMessages(sessionId, 8));
-              if (t) {
-                await setSessionTitle(sessionId, t, "llm");
-                console.log("🏷️ title upgraded:", t);
+          // ALL post-response work runs in ONE after() callback, in order:
+          // transcript first (the cadence reads it), then queued memory
+          // writes, then growth bookkeeping and the digest-cadence safety net.
+          defer(async () => {
+            // Persist the assistant turn (even a partial one) — history, cadence
+            // and digests all read from the DB transcript now.
+            await appendChatMessage(sessionId, "assistant", reply).catch(() => {});
+            for (const w of postWork) {
+              await w().catch((e) => console.error("🧠 post-write failed:", e));
+            }
+            // 🌱 Growth bookkeeping: recalled nodes the reply actually cited
+            // get their usage count bumped.
+            const used = recalled.filter((id) => {
+              const name = recalledNames[id];
+              return name && reply.toLowerCase().includes(name.toLowerCase());
+            });
+            if (used.length) await markRecallUsed(used).catch(() => {});
+            // Every 12 persisted messages: crystallize the recent stretch into a
+            // digest node + safety-net extraction over it (catches lasting facts
+            // the in-reply remember tool didn't fire on).
+            const count = await sessionMessageCount(sessionId).catch(() => 0);
+            // 🏷️ X5 stage 2: once the session has substance (6 msgs, then each
+            // digest boundary while still untitled-by-LLM), upgrade the title.
+            // Provenance guard: never overwrite an 'llm' or 'user' title.
+            if (count === 6 || (count > 6 && count % DIGEST_EVERY === 0)) {
+              try {
+                const info = await getSessionTitleInfo(sessionId);
+                if (info && info.title_source === "derived") {
+                  const t = await titleForSession(await recentChatMessages(sessionId, 8));
+                  if (t) {
+                    await setSessionTitle(sessionId, t, "llm");
+                    console.log("🏷️ title upgraded:", t);
+                  }
+                }
+              } catch {
+                /* best-effort title */
               }
-            })().catch(() => {});
-          }
-          if (count >= DIGEST_EVERY && count % DIGEST_EVERY === 0) {
-            recentChatMessages(sessionId, 16)
-              .then((stretch) => {
-                summarizeConversation(stretch)
-                  .then((r) => console.log("🌙 digest:", JSON.stringify(r)))
-                  .catch((e) => console.error("🌙 digest failed:", e));
-                extractFromStretch(stretch)
-                  .then((r) => console.log("🌙 digest-extract:", JSON.stringify(r)))
-                  .catch((e) => console.error("🌙 digest-extract failed:", e));
-              })
-              .catch(() => {});
-          }
+            }
+            if (count >= DIGEST_EVERY && count % DIGEST_EVERY === 0) {
+              const stretch = await recentChatMessages(sessionId, 16).catch(() => []);
+              if (stretch.length) {
+                const [d, x] = await Promise.allSettled([
+                  summarizeConversation(stretch),
+                  extractFromStretch(stretch),
+                ]);
+                if (d.status === "fulfilled") console.log("🌙 digest:", JSON.stringify(d.value));
+                else console.error("🌙 digest failed:", d.reason);
+                if (x.status === "fulfilled") console.log("🌙 digest-extract:", JSON.stringify(x.value));
+                else console.error("🌙 digest-extract failed:", x.reason);
+              }
+            }
+          });
         }
       },
     }),

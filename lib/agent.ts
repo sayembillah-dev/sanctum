@@ -344,6 +344,7 @@ export async function runExtraction(text: string) {
     dumpId: r.dumpId,
     nodes: { created: r.created, reused: r.reused },
     edgesCreated: r.edgesCreated,
+    edgesDropped: r.edgesDropped,
     updated: r.updated,
     forgotten: r.forgotten,
   };
@@ -357,7 +358,7 @@ async function applyExtraction(
   data: z.infer<typeof Extraction>,
   known: { id: string; type: string; name: string }[]
 ) {
-  const { dumpId, created, reused, edgesCreated } = await persistExtraction(
+  const { dumpId, created, reused, edgesCreated, edgesDropped } = await persistExtraction(
     sourceText,
     data.nodes,
     data.edges,
@@ -384,7 +385,7 @@ async function applyExtraction(
       if (u.close_edges.length) await closeEdges(up.id, u.close_edges);
     }
   }
-  return { dumpId, created, reused, edgesCreated, updated, forgotten };
+  return { dumpId, created, reused, edgesCreated, edgesDropped, updated, forgotten };
 }
 
 /** Conversational chat: tool-called memory writes + grounded streamed reply.
@@ -618,9 +619,13 @@ export async function applyRemembered(sourceText: string, argsJson: string) {
   // M7 (Hermes no-op success): a save that created nothing, linked nothing and
   // changed nothing is "already known" — surface that truthfully so the model
   // stops re-saving the same fact every time it comes up.
+  // A dropped edge is NOT a no-op — the save silently lost a fact, so the
+  // model must hear about it (and retry with the endpoint declared), not get
+  // a soothing "already known".
   const unchanged =
     r.created.length === 0 &&
     r.edgesCreated === 0 &&
+    r.edgesDropped.length === 0 &&
     r.updated.length === 0 &&
     r.forgotten.length === 0;
   return { ok: true as const, ...r, unchanged };
