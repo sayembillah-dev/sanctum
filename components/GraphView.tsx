@@ -118,6 +118,7 @@ export default function GraphView() {
     };
     edges: { src: string; dst: string; type: string; said_on: string | null }[];
   };
+  const [hover, setHover] = useState<string | null>(null); // 🖱️ hovered node id (Obsidian-style highlight)
   const [selected, setSelected] = useState<{ id: string; name: string; type: string; pinned?: boolean } | null>(null);
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [confirmForget, setConfirmForget] = useState(false);
@@ -161,6 +162,20 @@ export default function GraphView() {
     for (const l of data.links) {
       m.set(idOf(l.source), (m.get(idOf(l.source)) ?? 0) + 1);
       m.set(idOf(l.target), (m.get(idOf(l.target)) ?? 0) + 1);
+    }
+    return m;
+  }, [data]);
+
+  // 🖱️ 1-hop adjacency for hover highlight: hovered node + its direct synapses
+  // stay lit; everything else dims. (Decision: direct neighbors only — 2-hop on
+  // a hub-connected graph would light up nearly everything.)
+  const neighbors = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    for (const l of data.links) {
+      const a = idOf(l.source);
+      const b = idOf(l.target);
+      (m.get(a) ?? m.set(a, new Set()).get(a)!).add(b);
+      (m.get(b) ?? m.set(b, new Set()).get(b)!).add(a);
     }
     return m;
   }, [data]);
@@ -310,6 +325,8 @@ export default function GraphView() {
           const isSun = !!n.pinned;
           const color = isSun ? SUN : colorFor(n.type);
           const r = radiusOf(n);
+          // 🖱️ dimmed when hovering another node and NOT in its neighborhood
+          const dim = hover !== null && n.id !== hover && !neighbors.get(hover)?.has(n.id);
 
           // eased recall pulse
           const t0 = pulses.current.get(n.id);
@@ -320,7 +337,7 @@ export default function GraphView() {
           // halo — radial gradient, fades to nothing (no hard edge)
           const haloR = r * (2.1 + 1.2 * boost);
           const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
-          g.addColorStop(0, color + (boost > 0 ? "30" : "1a"));
+          g.addColorStop(0, color + (dim ? "07" : boost > 0 ? "30" : "1a"));
           g.addColorStop(1, color + "00");
           ctx.fillStyle = g;
           ctx.beginPath();
@@ -330,7 +347,7 @@ export default function GraphView() {
           // core
           ctx.beginPath();
           ctx.arc(n.x, n.y, r * (1 + 0.25 * boost), 0, Math.PI * 2);
-          ctx.fillStyle = color;
+          ctx.fillStyle = dim ? color + "24" : color; // dim → ~14% alpha core
           ctx.fill();
 
           // label — constant screen size, hidden when far zoomed out
@@ -339,7 +356,7 @@ export default function GraphView() {
             ctx.font = `${isSun ? 700 : 500} ${fs}px Inter, system-ui, sans-serif`;
             ctx.textAlign = "center";
             ctx.textBaseline = "top";
-            ctx.fillStyle = "rgba(226,232,255,0.82)";
+            ctx.fillStyle = dim ? "rgba(226,232,255,0.08)" : "rgba(226,232,255,0.82)";
             ctx.fillText(n.name, n.x, n.y + r + fs * 0.55);
           }
         }}
@@ -350,7 +367,14 @@ export default function GraphView() {
           ctx.arc(n.x, n.y, radiusOf(n) + 6, 0, Math.PI * 2);
           ctx.fill();
         }}
-        linkColor={() => "rgba(148,163,184,0.22)"}
+        onNodeHover={(n: any) => setHover(n ? (n as GNode).id : null)}
+        linkColor={(l: any) =>
+          hover === null
+            ? "rgba(148,163,184,0.22)"
+            : idOf(l.source) === hover || idOf(l.target) === hover
+              ? "rgba(165,180,252,0.6)" // incident synapse — lit indigo
+              : "rgba(148,163,184,0.05)" // the rest fade away
+        }
         linkWidth={1}
       />
 
