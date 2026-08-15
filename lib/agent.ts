@@ -390,20 +390,21 @@ export async function runConsolidation(opts: { apply?: boolean } = {}) {
 }
 
 export async function answerQuestion(question: string) {
-  const answerMd = await brain("answer.md");
-  const { text: context } = await buildContext(question);
+  // One retrieval, used twice: buildContext's salience-ranked nodes ARE the
+  // "recalled" list — previously this re-ran searchNodes(question, 8), burning a
+  // second identical embedding + scan for the same answer.
+  const [answerMd, ctx] = await Promise.all([brain("answer.md"), buildContext(question)]);
 
   const res = await ai().chat.completions.create({
     model: CHAT_MODEL,
     messages: [
       { role: "system", content: answerMd },
-      { role: "user", content: `Context:\n${context}\n\nQuestion: ${question}` },
+      { role: "user", content: `Context:\n${ctx.text}\n\nQuestion: ${question}` },
     ],
   });
 
-  const nodes = (await searchNodes(question, 8)).filter((n) => n.score >= MIN_RECALL_SCORE);
   return {
     answer: res.choices[0]?.message?.content ?? "",
-    recalled: nodes.map((n) => n.name),
+    recalled: Object.values(ctx.names),
   };
 }

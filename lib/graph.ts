@@ -1,5 +1,5 @@
 import { prisma } from "./db";
-import { embed } from "./ai";
+import { embed, embedNodeText } from "./ai";
 import type { Prisma } from "@prisma/client";
 
 const DEDUP_THRESHOLD = 0.85; // cosine similarity ≥ 0.85 → same entity (0.9 was too strict → duplicate nodes)
@@ -37,7 +37,10 @@ export async function findNode(name: string): Promise<string | null> {
     limit 1`;
   if (norm[0]) return norm[0].id;
 
-  const vector = lit(await embed(`entity: ${name}`));
+  // Bare name, no synthetic prefix: every stored node vector leads with
+  // "Type: name …", so name tokens dominate — the old "entity: {name}" prefix
+  // queried from a different text distribution and depressed similarity scores.
+  const vector = lit(await embed(name));
   const sim = await prisma.$queryRaw<{ id: string; score: number }[]>`
     select id, 1 - (embedding <=> ${vector}::vector) as score
     from nodes where embedding is not null and valid_to is null
@@ -71,7 +74,7 @@ export async function resolveNode(n: {
     limit 1`;
   if (norm[0]) return strengthen(norm[0].id);
 
-  const vector = lit(await embed(`${n.type}: ${n.name} ${JSON.stringify(n.attrs)}`));
+  const vector = lit(await embed(embedNodeText(n.type, n.name, n.attrs)));
   const sim = await prisma.$queryRaw<{ id: string; score: number }[]>`
     select id, 1 - (embedding <=> ${vector}::vector) as score
     from nodes where embedding is not null and valid_to is null
@@ -133,7 +136,7 @@ export async function updateNode(
     ...((row.attrs as Record<string, unknown> | null) ?? {}),
     ...(u.setAttrs ?? {}),
   };
-  const vector = lit(await embed(`${row.type}: ${newName} ${JSON.stringify(newAttrs)}`));
+  const vector = lit(await embed(embedNodeText(row.type, newName, newAttrs)));
   await prisma.node.update({
     where: { id },
     data: { name: newName, attrs: newAttrs as Prisma.InputJsonValue, updated_at: new Date() },
@@ -409,7 +412,7 @@ export async function mergeNodes(keepId: string, dropId: string): Promise<boolea
     ...((drop.attrs as Record<string, unknown> | null) ?? {}),
     ...((keep.attrs as Record<string, unknown> | null) ?? {}),
   };
-  const vector = lit(await embed(`${keep.type}: ${keep.name} ${JSON.stringify(mergedAttrs)}`));
+  const vector = lit(await embed(embedNodeText(keep.type, keep.name, mergedAttrs)));
   await prisma.node.update({
     where: { id: keepId },
     data: {
