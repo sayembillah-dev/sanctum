@@ -198,6 +198,8 @@ Schema lives in `db/migrations/` as plain SQL, auto-applied on `npm run dev` and
 - `npm run build` does not migrate; running DDL against production mid-build was risky. Run `npm run db:migrate` before deploying schema changes.
 - After changing the schema, mirror it in `prisma/schema.prisma` and run `npx prisma generate` so the client stays fully typed. Embedding columns are `Unsupported("vector(1536)")` in Prisma and are written via raw SQL only.
 
+To wipe all data for a fresh instance (keeps the schema): truncate the data tables. `_migrations` is left alone so nothing re-runs. Example: `node -e "/* load .env, then */ truncate table edges,nodes,dumps,feedback,chat_messages,chat_sessions,app_state,session,account,verification,user restart identity cascade"` with the table name quoted. The next signup afterwards becomes the first account and the admin.
+
 ## Smoke tests
 
 With the dev server running:
