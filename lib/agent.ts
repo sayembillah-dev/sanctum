@@ -3,9 +3,7 @@ import path from "node:path";
 import { z } from "zod";
 import { ai, CHAT_MODEL } from "./ai";
 import {
-  insertDump,
-  resolveNode,
-  createEdge,
+  persistExtraction,
   searchNodes,
   nodeEdges,
   recentNodes,
@@ -188,32 +186,13 @@ export async function runExtraction(text: string) {
     return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
   }
 
-  // --- Persist to the memory graph ---
-  const dumpId = await insertDump(text);
-
-  // Edge endpoints may reference existing memory by name — pre-seed the map
-  const idByName = new Map<string, string>();
-  for (const n of known.values()) idByName.set(n.name.toLowerCase(), n.id);
-
-  const created: string[] = [];
-  const reused: string[] = [];
-  for (const n of parsed.data.nodes) {
-    const { id, wasCreated } = await resolveNode(n);
-    idByName.set(n.name.toLowerCase(), id);
-    (wasCreated ? created : reused).push(n.name);
-  }
-
-  let edgesCreated = 0;
-  for (const e of parsed.data.edges) {
-    const srcId =
-      idByName.get(e.src.toLowerCase()) ?? (await findNode(e.src)) ?? undefined;
-    const dstId =
-      idByName.get(e.dst.toLowerCase()) ?? (await findNode(e.dst)) ?? undefined;
-    if (!srcId || !dstId) continue; // references something we truly don't know — skip
-    if (await createEdge({ srcId, dstId, type: e.type, saidOn: e.said_on, dumpId })) {
-      edgesCreated++;
-    }
-  }
+  // --- Persist to the memory graph — batched + atomic (see persistExtraction) ---
+  const { dumpId, created, reused, edgesCreated } = await persistExtraction(
+    text,
+    parsed.data.nodes,
+    parsed.data.edges,
+    [...known.values()]
+  );
 
   // --- Revision: update / supersede / forget existing memory ---
   const updated: string[] = [];
@@ -227,7 +206,6 @@ export async function runExtraction(text: string) {
     const up = await updateNode(u.node, { setAttrs: u.set_attrs, rename: u.rename });
     if (up) {
       updated.push(up.name);
-      idByName.set(up.name.toLowerCase(), up.id); // renamed node stays addressable
       if (u.close_edges.length) await closeEdges(up.id, u.close_edges);
     }
   }
