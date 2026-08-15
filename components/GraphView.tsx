@@ -59,6 +59,53 @@ export default function GraphView() {
   const dirtyUntil = useRef(0);
   const pulses = useRef<Map<string, number>>(new Map());
 
+  // ── node inspector ─────────────────────────────────────────────────────
+  type NodeDetail = {
+    node: GNode & {
+      attrs: Record<string, unknown>;
+      recall_used_count: number;
+      last_recalled_at: string | null;
+      created_at: string;
+    };
+    edges: { src: string; dst: string; type: string; said_on: string | null }[];
+  };
+  const [selected, setSelected] = useState<{ id: string; name: string; type: string; pinned?: boolean } | null>(null);
+  const [detail, setDetail] = useState<NodeDetail | null>(null);
+  const [confirmForget, setConfirmForget] = useState(false);
+
+  const inspect = (n: GNode) => {
+    setSelected({ id: n.id, name: n.name, type: n.type, pinned: n.pinned });
+    setConfirmForget(false);
+    setDetail(null);
+    fetch(`/api/graph/node?id=${encodeURIComponent(n.id)}`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d && setDetail(d))
+      .catch(() => {});
+  };
+
+  // Explicit user-initiated forget from the UI — same soft-close path as
+  // chat-based forgetting; the node drops out of the cosmos on the next merge.
+  const forgetSelected = async () => {
+    if (!selected) return;
+    if (!confirmForget) return setConfirmForget(true);
+    try {
+      const r = await fetch("/api/graph/node", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: selected.id, action: "forget" }),
+      });
+      if (r.ok) {
+        setSelected(null);
+        setDetail(null);
+        window.dispatchEvent(new Event("sanctum:dirty"));
+      }
+    } catch {
+      /* non-critical */
+    } finally {
+      setConfirmForget(false);
+    }
+  };
+
   // degree map → node sizing + collision
   const degrees = useMemo(() => {
     const m = new Map<string, number>();
@@ -107,14 +154,20 @@ export default function GraphView() {
       sig.current = nextSig;
       setData((prev) => {
         const old = new Map(prev.nodes.map((n) => [n.id, n]));
+        const alive = new Set(d.nodes.map((n) => n.id));
         return {
+          // The merge maps over the NEW node list — forgotten/merged nodes drop
+          // out of the cosmos live (no ghost neurons lingering until refresh).
           nodes: d.nodes.map((n) => {
             const o = old.get(n.id);
             return o ? Object.assign(o, n) : n; // keep positions across refreshes
           }),
-          links: d.links,
+          // defensive: never keep a link whose endpoint left the graph
+          links: d.links.filter((l) => alive.has(idOf(l.source)) && alive.has(idOf(l.target))),
         };
       });
+      // close the inspector if its node just left the graph (forgotten/merged)
+      setSelected((sel) => (sel && !d.nodes.some((n) => n.id === sel.id) ? null : sel));
     } catch {
       /* offline tolerance */
     }
@@ -172,6 +225,8 @@ export default function GraphView() {
           delete n.fy;
           fgRef.current?.d3ReheatSimulation?.();
         }}
+        onNodeClick={(n: any) => inspect(n as GNode)}
+        onBackgroundClick={() => setSelected(null)}
         // ── cosmic backdrop: twinkling stars + vignette (screen space) ──
         onRenderFramePre={(ctx: CanvasRenderingContext2D) => {
           const w = ctx.canvas.width;
@@ -247,6 +302,103 @@ export default function GraphView() {
       <div className="pointer-events-none absolute bottom-3 left-3 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] tracking-wide text-slate-300/80 backdrop-blur">
         {data.nodes.length} neurons · {data.links.length} synapses
       </div>
+
+      {/* ── node inspector — click a neuron ── */}
+      {selected && (
+        <div className="absolute right-3 top-3 z-10 flex max-h-[85%] w-72 flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0a0a18]/90 shadow-2xl backdrop-blur-md">
+          <div className="flex items-center gap-2 border-b border-white/[0.06] px-4 py-3">
+            <span
+              className="h-2.5 w-2.5 flex-none rounded-full"
+              style={{ backgroundColor: selected.pinned ? SUN : colorFor(selected.type) }}
+            />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-white">{selected.name}</p>
+              <p className="text-[10px] text-slate-500">
+                {selected.type}
+                {selected.pinned ? " · pinned ☀️" : ""}
+              </p>
+            </div>
+            <button
+              onClick={() => setSelected(null)}
+              aria-label="Close"
+              className="rounded-md px-1.5 py-0.5 text-xs text-slate-500 transition hover:bg-white/[0.06] hover:text-slate-300"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+            {!detail ? (
+              <p className="py-4 text-center text-[11px] text-slate-500">reading memory…</p>
+            ) : (
+              <>
+                <p className="text-[10px] text-slate-600">
+                  ×{detail.node.mention_count} mentions · cited {detail.node.recall_used_count}×
+                  {detail.node.last_recalled_at &&
+                    ` · last recalled ${detail.node.last_recalled_at.slice(0, 10)}`}
+                </p>
+
+                {Object.keys(detail.node.attrs ?? {}).length > 0 && (
+                  <>
+                    <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                      Attributes
+                    </p>
+                    <dl className="mt-1 space-y-1">
+                      {Object.entries(detail.node.attrs).map(([k, v]) => (
+                        <div key={k} className="flex gap-2 text-[11px]">
+                          <dt className="flex-none text-slate-500">{k}</dt>
+                          <dd className="min-w-0 flex-1 break-words text-slate-300">
+                            {typeof v === "string" ? v : JSON.stringify(v)}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </>
+                )}
+
+                {detail.edges.length > 0 && (
+                  <>
+                    <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                      Synapses
+                    </p>
+                    <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
+                      {detail.edges.map((e, i) => (
+                        <li key={i} className="truncate">
+                          {e.src === detail.node.name ? (
+                            <>
+                              —<span className="text-indigo-300">{e.type}</span>→ {e.dst}
+                            </>
+                          ) : (
+                            <>
+                              {e.src} —<span className="text-indigo-300">{e.type}</span>→
+                            </>
+                          )}
+                          {e.said_on && <span className="text-slate-600"> · {e.said_on}</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+
+          {!selected.pinned && (
+            <div className="border-t border-white/[0.06] px-4 py-3">
+              <button
+                onClick={forgetSelected}
+                className={`w-full rounded-xl border px-3 py-1.5 text-[11px] transition ${
+                  confirmForget
+                    ? "border-rose-400/40 bg-rose-500/15 text-rose-300"
+                    : "border-white/10 text-slate-400 hover:border-rose-400/40 hover:text-rose-300"
+                }`}
+              >
+                {confirmForget ? "Sure? This soft-deletes the node" : "Forget this memory"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
