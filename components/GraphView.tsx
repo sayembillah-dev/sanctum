@@ -102,6 +102,8 @@ export default function GraphView() {
   const prevVisible = useRef<Set<string>>(new Set());
   const prevLinkKeys = useRef<Set<string>>(new Set()); // visible synapses last frame (grow-in tracking)
   const linkBirths = useRef<Map<string, number>>(new Map()); // "a|b" → first-visible ts
+  const linkPulses = useRef<Map<string, number>>(new Map()); // "a|b" → recall-pulse ts (AI used this synapse)
+  const dataRef = useRef<GData>({ nodes: [], links: [] }); // latest snapshot for once-registered handlers
 
   const stopPlay = () => {
     if (playRef.current !== null) cancelAnimationFrame(playRef.current);
@@ -351,6 +353,14 @@ export default function GraphView() {
       const ids: string[] = (e as CustomEvent).detail?.ids ?? [];
       const now = performance.now();
       ids.forEach((id) => pulses.current.set(id, now));
+      // light the synapses BETWEEN recalled neurons — both endpoints recalled
+      // means the model connected them to build this reply
+      const s = new Set(ids);
+      for (const l of dataRef.current.links) {
+        const a = idOf(l.source);
+        const b = idOf(l.target);
+        if (s.has(a) && s.has(b)) linkPulses.current.set(`${a}|${b}`, now);
+      }
     };
     window.addEventListener("sanctum:dirty", onDirty);
     window.addEventListener("sanctum:recalled", onRecalled);
@@ -367,6 +377,7 @@ export default function GraphView() {
 
   // fit on first load; gently reheat + refit when the brain grows
   useEffect(() => {
+    dataRef.current = data;
     if (!data.nodes.length) return;
     const grew = data.nodes.length > prevCount.current;
     prevCount.current = data.nodes.length;
@@ -511,11 +522,17 @@ export default function GraphView() {
           const kb = linkBirths.current.get(`${a}|${b}`);
           const kf = kb === undefined ? 1 : Math.min(1, (performance.now() - kb) / 950);
           if (kb !== undefined && kf >= 1) linkBirths.current.delete(`${a}|${b}`);
-          return v >= 0
+          // 🧠 recall pulse: the AI just used this synapse — bright glow, eased PULSE_MS fade
+          const pt = linkPulses.current.get(`${a}|${b}`);
+          const praw = pt !== undefined ? Math.max(0, 1 - (performance.now() - pt) / PULSE_MS) : 0;
+          const pb = praw * praw;
+          if (pt !== undefined && praw <= 0) linkPulses.current.delete(`${a}|${b}`);
+          const lit = Math.max(v, pb); // pulse overrides hover-dim
+          return v >= 0 || pb > 0.02
             ? // ease slate → lit indigo
-              `rgba(${Math.round(mix(148, 165, v))},${Math.round(mix(163, 180, v))},${Math.round(
-                mix(184, 252, v)
-              )},${(mix(0.22, 0.6, v) * kf).toFixed(3)})`
+              `rgba(${Math.round(mix(148, 196, lit))},${Math.round(mix(163, 181, lit))},${Math.round(
+                mix(184, 255, lit)
+              )},${(Math.min(0.95, mix(0.22, 0.6, lit) + pb * 0.3) * kf).toFixed(3)})`
             : // ease toward background
               `rgba(148,163,184,${(mix(0.22, 0.05, -v) * kf).toFixed(3)})`;
         }}
@@ -524,7 +541,9 @@ export default function GraphView() {
           const v = linkFx.current.get(k) ?? 0;
           const kb = linkBirths.current.get(k);
           const kf = kb === undefined ? 1 : 0.3 + 0.7 * Math.min(1, (performance.now() - kb) / 950);
-          return (v > 0 ? 1 + v * 0.5 : 1) * kf; // lit synapses thicken slightly
+          const pt = linkPulses.current.get(k);
+          const praw = pt !== undefined ? Math.max(0, 1 - (performance.now() - pt) / PULSE_MS) : 0;
+          return (v > 0 ? 1 + v * 0.5 : 1) * kf * (1 + praw * praw * 0.9); // pulses thicken hard
         }}
       />
 
