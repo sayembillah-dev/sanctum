@@ -335,6 +335,20 @@ async function applyExtraction(
  *  to save (zero extra LLM calls), and digest-cadence extraction is the safety
  *  net. The profile and open loops are ALWAYS in context — this is what makes
  *  Sanctum feel like it knows you better every time. */
+/** Trivial-prompt gate, ported from Hermes `is_trivial_prompt`
+ *  (memory_provider.py:84): bare acknowledgements and greetings carry no
+ *  semantic signal, so recall is skipped entirely — no embedding call, no
+ *  vector search, no DB round-trip. Anchored alternation + trailing-punctuation
+ *  allowance, so "k8s" or "yolo" never match but "hi!" / "thanks :)" do. */
+const TRIVIAL_PROMPT_RE =
+  /^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|hi|hey|hello|yo|sup|continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)[\s!?.:;,"'‘’“”—–…()\[\]{}<>*&^%$#@!+=` ]*$/i;
+
+function isTrivialPrompt(text: string): boolean {
+  const s = (text ?? "").trim();
+  if (!s || s.startsWith("/")) return true;
+  return TRIVIAL_PROMPT_RE.test(s);
+}
+
 export async function chat(messages: ChatMessage[]) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
 
@@ -349,9 +363,14 @@ export async function chat(messages: ChatMessage[]) {
       .map((m) => m.content)
       .join("\n") || lastUser;
 
+  const trivial = isTrivialPrompt(lastUser);
+  if (trivial) console.log("🧠 recall skipped: trivial message");
+
   const [chatMd, ctx, loops, profileEdges] = await Promise.all([
     brain("chat.md"),
-    buildContext(recallQuery, profile.id),
+    trivial
+      ? Promise.resolve({ ids: [] as string[], names: {} as Record<string, string>, text: "" })
+      : buildContext(recallQuery, profile.id),
     openLoops(),
     nodeEdges([profile.id]),
   ]);
