@@ -21,6 +21,7 @@ export default function Chat() {
   const [error, setError] = useState<string | null>(null);
   const [fb, setFb] = useState<Record<number, 1 | -1>>({}); // msg index → rating given
   const [recap, setRecap] = useState<Recap | "loading" | null>(null);
+  const [title, setTitle] = useState<string | null>(null); // 🏷️ X5 session title
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -39,6 +40,7 @@ export default function Chat() {
       .then((r) => r.json())
       .then((d) => {
         if (Array.isArray(d.messages) && d.messages.length) setMessages(d.messages);
+        if (typeof d.title === "string" && d.title) setTitle(d.title);
       })
       .catch(() => {});
   }, []);
@@ -76,6 +78,7 @@ export default function Chat() {
     setMessages([]);
     setFb({});
     setError(null);
+    setTitle(null); // fresh session — its first message will name it
     setConfirmClear(false);
   }
 
@@ -103,6 +106,8 @@ export default function Chat() {
       if (recalled) {
         window.dispatchEvent(new CustomEvent("sanctum:recalled", { detail: JSON.parse(recalled) }));
       }
+      const st = res.headers.get("X-Session-Title");
+      if (st) setTitle(decodeURIComponent(st));
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let acc = "";
@@ -172,6 +177,15 @@ export default function Chat() {
         >
           ✨ Week
         </button>
+        {/* 🏷️ session title — instant slice first, LLM-upgraded as the conversation grows */}
+        {title && (
+          <p
+            title={title}
+            className="pointer-events-none absolute left-1/2 top-[15px] z-10 max-w-[34%] -translate-x-1/2 truncate text-[11px] italic text-slate-500"
+          >
+            {title}
+          </p>
+        )}
         {messages.length > 0 && (
           <button
             onClick={clearChat}

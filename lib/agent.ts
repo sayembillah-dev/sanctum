@@ -679,6 +679,41 @@ export async function extractFromStretch(messages: ChatMessage[]) {
   return runExtraction(transcript);
 }
 
+/** 🏷️ X5 stage 2 — upgrade the deterministic first-message slice into a real
+ *  title. Small temp-0 call over the recent transcript; validated + capped.
+ *  Best-effort: returns null on any failure (the derived title stays). */
+export async function titleForSession(messages: ChatMessage[]): Promise<string | null> {
+  const transcript = messages
+    .slice(-8)
+    .map((m) => `${m.role === "user" ? "User" : "Sanctum"}: ${m.content.slice(0, 200)}`)
+    .join("\n")
+    .slice(0, 2000);
+  if (!transcript) return null;
+  try {
+    const res = await withRetry(
+      () =>
+        ai().chat.completions.create({
+          model: CHAT_MODEL,
+          temperature: 0,
+          max_tokens: 24,
+          messages: [
+            {
+              role: "system",
+              content:
+                "Title this conversation in 3–6 words. No quotes, no trailing period, no 'Title:' prefix — just the title.",
+            },
+            { role: "user", content: transcript },
+          ],
+        }),
+      { attempts: 2, label: "title" }
+    );
+    const t = res.choices[0]?.message?.content?.trim().replace(/^["']+|["'.!?…]+$/g, "");
+    return t && t.length <= 60 ? t : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 🌙 Session digest: condense a stretch of conversation into a graph-visible
  * Conversation node, linked to everything it touched. Called automatically every

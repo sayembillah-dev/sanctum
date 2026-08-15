@@ -87,3 +87,13 @@ model AppState {
 
   @@map("app_state")
 }
+
+// ── Conversation titles (006) ──
+model ChatSession {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title        String?
+  title_source String   @default("derived") // derived (instant slice) < llm (upgraded) < user (manual)
+  created_at   DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("chat_sessions")
+}

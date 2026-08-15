@@ -543,7 +543,41 @@ export async function rotateSession(): Promise<string> {
     update: { value: id },
     create: { key: "current_session", value: id },
   });
+  // Raw SQL: the table is mirrored in schema.prisma but the client regen is
+  // deferred (dev server locks the engine DLL) — same pattern as embeddings.
+  await prisma.$executeRaw`insert into chat_sessions (id) values (${id}::uuid) on conflict do nothing`;
   return id;
+}
+
+// ── X5: two-stage session titles (Hermes title_generator.py) ─────────────
+// Stage 1 "derived": instant 48-char slice of the first user message, set BEFORE
+// the model call. Stage 2 "llm": upgraded by a small temp-0 call once the
+// conversation has substance. Provenance ranks: user > llm > derived — a title
+// is only ever replaced by an equal-or-higher-trust source.
+
+/** Title write with provenance ranking — lower-trust sources never overwrite. */
+export async function setSessionTitle(
+  id: string,
+  title: string,
+  source: "derived" | "llm" | "user"
+): Promise<void> {
+  const clean = title.replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  await prisma.$executeRaw`
+    insert into chat_sessions (id, title, title_source)
+    values (${id}::uuid, ${clean}, ${source})
+    on conflict (id) do update
+      set title = excluded.title, title_source = excluded.title_source
+      where case chat_sessions.title_source when 'user' then 2 when 'llm' then 1 else 0 end
+         <= case excluded.title_source      when 'user' then 2 when 'llm' then 1 else 0 end`;
+}
+
+export async function getSessionTitleInfo(
+  id: string
+): Promise<{ title: string | null; title_source: string } | null> {
+  const rows = await prisma.$queryRaw<{ title: string | null; title_source: string }[]>`
+    select title, title_source from chat_sessions where id = ${id}::uuid`;
+  return rows[0] ?? null;
 }
 
 export async function appendChatMessage(

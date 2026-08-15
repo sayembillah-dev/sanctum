@@ -4,6 +4,7 @@ import {
   applyRemembered,
   summarizeConversation,
   extractFromStretch,
+  titleForSession,
 } from "@/lib/agent";
 import {
   markRecallUsed,
@@ -11,6 +12,8 @@ import {
   appendChatMessage,
   recentChatMessages,
   sessionMessageCount,
+  setSessionTitle,
+  getSessionTitleInfo,
 } from "@/lib/graph";
 
 // Digest cadence: every 12 persisted messages (= 6 user⇄assistant exchanges).
@@ -35,6 +38,14 @@ export async function POST(req: Request) {
   const sessionId = await currentSessionId();
   await appendChatMessage(sessionId, "user", message);
   const messages = await recentChatMessages(sessionId, 40);
+
+  // 🏷️ X5 stage 1: the very first user message names the session INSTANTLY
+  // (deterministic slice, before any model call) — even a failed first reply
+  // leaves a named conversation. The LLM upgrade arrives later (see finally).
+  if (messages.length === 1) {
+    await setSessionTitle(sessionId, message.slice(0, 48), "derived").catch(() => {});
+  }
+  const titleInfo = await getSessionTitleInfo(sessionId).catch(() => null);
 
   const { stream, recalled, recalledNames, requestMessages } = await chat(messages);
   const encoder = new TextEncoder();
@@ -167,6 +178,20 @@ export async function POST(req: Request) {
           // digest node + safety-net extraction over it (catches lasting facts
           // the in-reply remember tool didn't fire on).
           const count = await sessionMessageCount(sessionId).catch(() => 0);
+          // 🏷️ X5 stage 2: once the session has substance (6 msgs, then each
+          // digest boundary while still untitled-by-LLM), upgrade the title.
+          // Provenance guard: never overwrite an 'llm' or 'user' title.
+          if (count === 6 || (count > 6 && count % DIGEST_EVERY === 0)) {
+            (async () => {
+              const info = await getSessionTitleInfo(sessionId);
+              if (!info || info.title_source !== "derived") return;
+              const t = await titleForSession(await recentChatMessages(sessionId, 8));
+              if (t) {
+                await setSessionTitle(sessionId, t, "llm");
+                console.log("🏷️ title upgraded:", t);
+              }
+            })().catch(() => {});
+          }
           if (count >= DIGEST_EVERY && count % DIGEST_EVERY === 0) {
             recentChatMessages(sessionId, 16)
               .then((stretch) => {
@@ -187,6 +212,8 @@ export async function POST(req: Request) {
         "Content-Type": "text/plain; charset=utf-8",
         // Which neurons fired for this reply — the graph view pulses these
         "X-Recalled-Nodes": JSON.stringify(recalled),
+        // 🏷️ current session title (uri-encoded — headers are latin-1 only)
+        ...(titleInfo?.title ? { "X-Session-Title": encodeURIComponent(titleInfo.title) } : {}),
       },
     }
   );
