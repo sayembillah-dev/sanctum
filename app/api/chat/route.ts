@@ -85,7 +85,9 @@ export async function POST(req: Request) {
                 console.log("🧠 remember:", JSON.stringify(r));
                 results.push(
                   r.ok
-                    ? "✓ Saved to long-term memory."
+                    ? r.unchanged
+                      ? "✓ Already known — this exact memory exists, nothing changed. Don't save it again in future replies."
+                      : "✓ Saved to long-term memory."
                     : `✗ Memory save failed: ${r.error}. Fix the arguments and retry once, or skip saving.`
                 );
               } catch (e) {

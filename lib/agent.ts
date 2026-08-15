@@ -326,6 +326,11 @@ async function applyExtraction(
       if (f) forgotten.push(f.name);
       continue;
     }
+    // M7: skip content-free updates entries (no attrs, no rename, no edge
+    // closures) — they used to trigger a full re-embed + 2 writes for nothing,
+    // and they made no-op saves indistinguishable from real changes.
+    const hasContent = Object.keys(u.set_attrs ?? {}).length > 0 || !!u.rename?.trim();
+    if (!hasContent && !u.close_edges.length) continue;
     const up = await updateNode(u.node, { setAttrs: u.set_attrs, rename: u.rename });
     if (up) {
       updated.push(up.name);
@@ -554,7 +559,15 @@ export async function applyRemembered(sourceText: string, argsJson: string) {
     return { ok: false as const, error: `memory write blocked by content scan (${threat})` };
   }
   const r = await applyExtraction(sourceText, parsed.data, []);
-  return { ok: true as const, ...r };
+  // M7 (Hermes no-op success): a save that created nothing, linked nothing and
+  // changed nothing is "already known" — surface that truthfully so the model
+  // stops re-saving the same fact every time it comes up.
+  const unchanged =
+    r.created.length === 0 &&
+    r.edgesCreated === 0 &&
+    r.updated.length === 0 &&
+    r.forgotten.length === 0;
+  return { ok: true as const, ...r, unchanged };
 }
 
 /** Phase 2 of the tool loop: the model called remember INSTEAD of replying
