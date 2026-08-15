@@ -195,6 +195,53 @@ async function chatJson(system: string, user: string): Promise<unknown | null> {
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
+// ── M6: recall query rewrite (ported from Hermes plugins/memory/query_rewrite.py) ──
+// Follow-ups like "what did he say about it?" are useless as vector-search
+// queries on their own. One aux temp-0 call rewrites the recent turns into ONE
+// standalone search question; strict validation (question-word start, length,
+// no instruction-leak) with silent fallback to the raw 3-turn concat.
+const QUESTION_START =
+  /^(who|what|when|where|why|how|which|whose|whom|did|does|do|is|are|was|were|has|have|had|can|could|should|would|tell|show|list)\b/i;
+
+async function rewriteRecallQuery(messages: ChatMessage[]): Promise<string | null> {
+  const transcript = messages
+    .slice(-6)
+    .map((m) => `${m.role === "user" ? "User" : "Sanctum"}: ${m.content.slice(0, 500)}`)
+    .join("\n")
+    .slice(0, 3000);
+  if (!transcript) return null;
+  try {
+    const res = await withRetry(
+      () =>
+        ai().chat.completions.create({
+          model: CHAT_MODEL,
+          temperature: 0,
+          max_tokens: 100,
+          messages: [
+            {
+              role: "system",
+              content: [
+                "Rewrite the user's LATEST message into ONE standalone search question for a personal memory database.",
+                "Resolve pronouns and references using the conversation (e.g. 'he' → the person's name).",
+                "If the latest message is already standalone, keep it as-is (as a question).",
+                "Output ONLY the question — it must start with a question word (who/what/when/where/why/how/did/does/is/are/was/were…).",
+              ].join("\n"),
+            },
+            { role: "user", content: transcript },
+          ],
+        }),
+      { attempts: 2, label: "query-rewrite" }
+    );
+    const q = res.choices[0]?.message?.content?.trim().replace(/^["'`]+|["'`]+$/g, "");
+    if (!q || q.length < 8 || q.length > 300) return null;
+    if (!QUESTION_START.test(q)) return null; // must be a real question
+    if (/\b(ignore|system prompt|your instructions|forget everything)\b/i.test(q)) return null; // leak guard
+    return q;
+  } catch {
+    return null; // rewrite is best-effort — never breaks the turn
+  }
+}
+
 // Retrieval guards: pgvector ALWAYS returns top-N, even when every hit is irrelevant —
 // so without a similarity floor, unrelated nodes pollute the prompt (and waste tokens).
 const MIN_RECALL_SCORE = 0.4; // cosine similarity floor for "this memory is actually relevant"
@@ -366,7 +413,7 @@ export async function chat(messages: ChatMessage[]) {
 
   // Recall from the last few user turns, not just the latest — follow-ups like
   // "what did he say about it?" carry no entity names on their own.
-  const recallQuery =
+  const rawRecallQuery =
     messages
       .filter((m) => m.role === "user")
       .slice(-3)
@@ -376,14 +423,23 @@ export async function chat(messages: ChatMessage[]) {
   const trivial = isTrivialPrompt(lastUser);
   if (trivial) console.log("🧠 recall skipped: trivial message");
 
-  const [chatMd, ctx, loops, profileEdges] = await Promise.all([
+  // M6: the rewrite call runs CONCURRENTLY with the other context fetches —
+  // only buildContext depends on it, so it adds ~0 wall-clock latency.
+  const rewriteP = trivial ? Promise.resolve(null) : rewriteRecallQuery(messages);
+
+  const [chatMd, loops, profileEdges, rewritten] = await Promise.all([
     brain("chat.md"),
-    trivial
-      ? Promise.resolve({ ids: [] as string[], names: {} as Record<string, string>, text: "" })
-      : buildContext(recallQuery, profile.id),
     openLoops(),
     nodeEdges([profile.id]),
+    rewriteP,
   ]);
+
+  const recallQuery = rewritten ?? rawRecallQuery;
+  if (rewritten) console.log("🧠 recall query rewritten:", rewritten.slice(0, 120));
+
+  const ctx = trivial
+    ? { ids: [] as string[], names: {} as Record<string, string>, text: "" }
+    : await buildContext(recallQuery, profile.id);
 
   const loopsText = loops.length
     ? loops
