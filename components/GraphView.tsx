@@ -26,6 +26,32 @@ const TYPE_COLORS: Record<string, string> = {
 const colorFor = (t: string) => TYPE_COLORS[t] ?? "#94a3b8";
 const SUN = "#fcd34d";
 
+// ── smooth hover-highlight helpers ──────────────────────────────────────────
+// Per-entity factors lerp toward their target every paint frame (the canvas
+// already repaints continuously for the starfield, so easing is free).
+const mix = (a: number, b: number, t: number) => a + (b - a) * t;
+const rgbCache = new Map<string, [number, number, number]>();
+const rgbOf = (hex: string): [number, number, number] => {
+  let v = rgbCache.get(hex);
+  if (!v) {
+    v = [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+    rgbCache.set(hex, v);
+  }
+  return v;
+};
+/** Lerp a map-held value toward target at `rate`/frame; settled 0s are dropped. */
+const lerpTo = (map: Map<string, number>, key: string, target: number, rate = 0.2): number => {
+  const cur = map.get(key) ?? 0;
+  if (Math.abs(target - cur) < 0.01) {
+    if (target === 0) map.delete(key);
+    else map.set(key, target);
+    return target;
+  }
+  const next = cur + (target - cur) * rate;
+  map.set(key, next);
+  return next;
+};
+
 type GNode = {
   id: string;
   type: string;
@@ -119,6 +145,8 @@ export default function GraphView() {
     edges: { src: string; dst: string; type: string; said_on: string | null }[];
   };
   const [hover, setHover] = useState<string | null>(null); // 🖱️ hovered node id (Obsidian-style highlight)
+  const dimMap = useRef(new Map<string, number>()); // node id → 0 lit … 1 dimmed (lerped)
+  const linkFx = useRef(new Map<string, number>()); // "a|b" → -1 dimmed … 0 … +1 lit (lerped)
   const [selected, setSelected] = useState<{ id: string; name: string; type: string; pinned?: boolean } | null>(null);
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [confirmForget, setConfirmForget] = useState(false);
@@ -325,8 +353,10 @@ export default function GraphView() {
           const isSun = !!n.pinned;
           const color = isSun ? SUN : colorFor(n.type);
           const r = radiusOf(n);
-          // 🖱️ dimmed when hovering another node and NOT in its neighborhood
-          const dim = hover !== null && n.id !== hover && !neighbors.get(hover)?.has(n.id);
+          // 🖱️ smooth hover dim: the factor eases toward its target each frame
+          const dimTarget = hover !== null && n.id !== hover && !neighbors.get(hover)?.has(n.id) ? 1 : 0;
+          const dimF = lerpTo(dimMap.current, n.id, dimTarget);
+          const [cr, cg, cb] = rgbOf(color);
 
           // eased recall pulse
           const t0 = pulses.current.get(n.id);
@@ -337,7 +367,7 @@ export default function GraphView() {
           // halo — radial gradient, fades to nothing (no hard edge)
           const haloR = r * (2.1 + 1.2 * boost);
           const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
-          g.addColorStop(0, color + (dim ? "07" : boost > 0 ? "30" : "1a"));
+          g.addColorStop(0, `rgba(${cr},${cg},${cb},${mix(boost > 0 ? 0.19 : 0.1, 0.028, dimF).toFixed(3)})`);
           g.addColorStop(1, color + "00");
           ctx.fillStyle = g;
           ctx.beginPath();
@@ -347,7 +377,7 @@ export default function GraphView() {
           // core
           ctx.beginPath();
           ctx.arc(n.x, n.y, r * (1 + 0.25 * boost), 0, Math.PI * 2);
-          ctx.fillStyle = dim ? color + "24" : color; // dim → ~14% alpha core
+          ctx.fillStyle = `rgba(${cr},${cg},${cb},${mix(1, 0.14, dimF).toFixed(3)})`;
           ctx.fill();
 
           // label — constant screen size, hidden when far zoomed out
@@ -356,7 +386,7 @@ export default function GraphView() {
             ctx.font = `${isSun ? 700 : 500} ${fs}px Inter, system-ui, sans-serif`;
             ctx.textAlign = "center";
             ctx.textBaseline = "top";
-            ctx.fillStyle = dim ? "rgba(226,232,255,0.08)" : "rgba(226,232,255,0.82)";
+            ctx.fillStyle = `rgba(226,232,255,${mix(0.82, 0.08, dimF).toFixed(3)})`;
             ctx.fillText(n.name, n.x, n.y + r + fs * 0.55);
           }
         }}
@@ -368,14 +398,23 @@ export default function GraphView() {
           ctx.fill();
         }}
         onNodeHover={(n: any) => setHover(n ? (n as GNode).id : null)}
-        linkColor={(l: any) =>
-          hover === null
-            ? "rgba(148,163,184,0.22)"
-            : idOf(l.source) === hover || idOf(l.target) === hover
-              ? "rgba(165,180,252,0.6)" // incident synapse — lit indigo
-              : "rgba(148,163,184,0.05)" // the rest fade away
-        }
-        linkWidth={1}
+        linkColor={(l: any) => {
+          const a = idOf(l.source);
+          const b = idOf(l.target);
+          const target = hover === null ? 0 : a === hover || b === hover ? 1 : -1;
+          const v = lerpTo(linkFx.current, `${a}|${b}`, target, 0.16);
+          return v >= 0
+            ? // ease slate → lit indigo
+              `rgba(${Math.round(mix(148, 165, v))},${Math.round(mix(163, 180, v))},${Math.round(
+                mix(184, 252, v)
+              )},${mix(0.22, 0.6, v).toFixed(3)})`
+            : // ease toward background
+              `rgba(148,163,184,${mix(0.22, 0.05, -v).toFixed(3)})`;
+        }}
+        linkWidth={(l: any) => {
+          const v = linkFx.current.get(`${idOf(l.source)}|${idOf(l.target)}`) ?? 0;
+          return v > 0 ? 1 + v * 0.5 : 1; // lit synapses thicken slightly
+        }}
       />
 
       {/* counters */}
