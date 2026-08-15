@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db";
 import { runExtraction } from "@/lib/agent";
 import { requireAdmin } from "@/lib/auth";
+import { buildVault } from "@/lib/mirror";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -31,6 +32,18 @@ export async function POST() {
   }
 
   const ok = results.filter((r) => r.ok);
+
+  // 🪞 Rebuild truncated dumps and re-minted them with fresh ids — the mirror's
+  // day files still hold pre-rebuild entries. Regenerate the vault from the
+  // fresh DB so disk matches truth again. Best-effort: the rebuild itself
+  // already succeeded, a mirror failure must not fail the response.
+  let mirror: unknown = null;
+  try {
+    mirror = await buildVault();
+  } catch (e) {
+    console.warn("🪞 vault regen after rebuild failed:", e);
+  }
+
   return Response.json({
     ok: true,
     dumps: dumps.length,
@@ -38,5 +51,6 @@ export async function POST() {
     nodesCreated: ok.reduce((a, r) => a + (r.ok ? r.nodes.created.length : 0), 0),
     edgesCreated: ok.reduce((a, r) => a + (r.ok ? r.edgesCreated : 0), 0),
     failures: results.filter((r) => !r.ok),
+    mirror,
   });
 }

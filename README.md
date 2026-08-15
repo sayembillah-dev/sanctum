@@ -85,6 +85,16 @@ flowchart TD
 - `lib/ai.ts`: every model call runs through `withRetry`, jittered exponential backoff that honors the server's Retry-After header on 429, 408, and 5xx responses. Permanent 4xx errors throw at once.
 - `scripts/test-repair.mjs` mirrors `repairToolArguments`, which fixes malformed tool-call JSON from the model before it is parsed.
 
+## Data durability (file over app)
+
+Postgres is a rebuildable index; your dumps are the source of truth — and the truth also lives as plain text on disk, not only in the database. `lib/mirror.ts` maintains an Obsidian-ready vault at `./mirror` (override with `SANCTUM_MIRROR_DIR`; gitignored):
+
+- **Write-through**: every dump is appended to `mirror/dumps/YYYY-MM-DD.md` (local-time day files) the moment it persists. Idempotent (a dump-id marker prevents doubles), fire-and-forget, never blocks a memory write.
+- **Full vault export**: `GET /api/admin/export?format=vault` regenerates the whole vault from the DB — day files, one note per node under `nodes/<Type>/` with edges rendered as `[[wiki links]]`, forgotten nodes in `graveyard/`, plus a `00 - Sanctum.md` index — and downloads it as one zip. The build also sweeps files it didn't write, so disk ends matching the DB. `/api/admin/rebuild` runs this automatically at the end.
+- **Worst case**: Sanctum is gone, Neon is gone — `mirror/` still opens in Obsidian: every memory readable, the graph browsable. The JSON export (`/api/admin/export`, default) remains for full-fidelity backup; it also carries feedback and chat messages, which the vault intentionally leaves out.
+
+Note: on serverless (Vercel) the disk is ephemeral, so there only the zip download is durable. The always-current mirror is a feature of the local run.
+
 ## Grows with you
 
 Five feedback loops make every chat improve the next:
@@ -137,6 +147,7 @@ lib/
   auth.ts               better-auth config, signup policy hook, requireUser/requireAdmin
   auth-client.ts        Client auth (signUp/signIn/signOut/useSession)
   guard.ts              Content scan for memory-bound text (injection and secrets)
+  mirror.ts             File-over-app durability: dump write-through, Obsidian vault build + zip
   db.ts                 Prisma client
 proxy.ts                The gate: optimistic session-cookie check, redirects to /login
 prisma/schema.prisma    Typed mirror of the SQL schema (embedding columns are Unsupported, raw SQL only)
@@ -167,6 +178,7 @@ Open http://localhost:3000. You are redirected to `/login`; create the first acc
 | `CRON_SECRET` | production | Vercel sends it as `Authorization: Bearer <CRON_SECRET>` when calling the consolidation endpoint. Leave empty in local dev and the endpoint stays open |
 | `BETTER_AUTH_SECRET` | production | Session signing secret (32+ chars). Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `BETTER_AUTH_URL` | production | Base URL of the app, for example `https://your-app.vercel.app`. Auth POSTs are origin-checked against it |
+| `SANCTUM_MIRROR_DIR` | no | Where the markdown mirror vault lives. Default: `./mirror` in the project |
 
 ## API reference
 
@@ -186,9 +198,9 @@ All routes require a signed-in session except `/api/auth/*`, `GET /api/settings`
 | `/api/recap` | GET | What Sanctum learned this week: growth made visible |
 | `/api/feedback` | POST | Thumbs up/down on a reply; consolidation reads these to correct itself |
 | `/api/conversations/digest` | POST | Session-end crystallization from the server-side transcript, then rotation to a fresh session |
-| `/api/admin/rebuild` | POST | Wipe nodes and edges, then re-extract every dump in order. Dumps are the source of truth; the graph is a derived view |
+| `/api/admin/rebuild` | POST | Wipe nodes and edges, then re-extract every dump in order. Dumps are the source of truth; the graph is a derived view. Regenerates the markdown mirror afterwards |
 | `/api/admin/consolidate` | GET, POST | Sleep cycle. GET (cron) and plain POST are dry runs; POST `{ "apply": true }` also applies merges |
-| `/api/admin/export` | GET | Full backup of the brain as one JSON file: dumps, nodes (embeddings excluded), edges, feedback, chat messages |
+| `/api/admin/export` | GET | Full backup of the brain as one JSON file: dumps, nodes (embeddings excluded), edges, feedback, chat messages. `?format=vault` regenerates the Obsidian-ready markdown mirror on disk and downloads it as a zip |
 
 ## Database and migrations
 

@@ -1,5 +1,6 @@
 import { prisma } from "./db";
 import { embed, embedBatch, embedNodeText } from "./ai";
+import { mirrorDump } from "./mirror";
 import { Prisma } from "@prisma/client";
 
 const DEDUP_THRESHOLD = 0.85; // cosine similarity ≥ 0.85 → same entity (0.9 was too strict → duplicate nodes)
@@ -162,9 +163,14 @@ export async function persistExtraction(
     }
   }
 
-  return prisma.$transaction(
+  let dumpStamp: Date | null = null;
+  const out = await prisma.$transaction(
     async (tx) => {
-      const dump = await tx.dump.create({ data: { raw_text: rawText }, select: { id: true } });
+      const dump = await tx.dump.create({
+        data: { raw_text: rawText },
+        select: { id: true, created_at: true },
+      });
+      dumpStamp = dump.created_at;
 
       const created: string[] = [];
       const reused: string[] = [];
@@ -303,6 +309,15 @@ export async function persistExtraction(
     },
     { timeout: 15000 } // Neon cold starts can be slow; HTTP work stays outside the tx
   );
+
+  // 🪞 Write-through mirror ("file over app"): dumps are the source of truth, so
+  // every one lands as plain markdown on disk the moment it persists. Fire-and-
+  // forget — a mirror hiccup must never fail a memory write; the next vault
+  // export (buildVault) regenerates everything from the DB and heals any gap.
+  mirrorDump({ id: out.dumpId, raw_text: rawText, created_at: dumpStamp ?? new Date() }).catch(
+    (e) => console.warn("🪞 mirror append failed:", e)
+  );
+  return out;
 }
 
 /**
