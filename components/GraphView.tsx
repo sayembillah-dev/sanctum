@@ -373,6 +373,10 @@ export default function GraphView() {
         warmupTicks={120}
         d3AlphaDecay={0.02}
         d3VelocityDecay={0.28}
+        cooldownTime={Infinity}
+        // ^ never let the render engine cool off. With the default cooldown the
+        // canvas simply STOPS painting between state changes — that's what made
+        // the timelapse (and the starfield) jump instead of animate smoothly.
         enableNodeDrag
         onNodeDragEnd={(n: any) => {
           delete n.fx; // release → the live sim bounces it back into the disc
