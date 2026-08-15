@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { ai, CHAT_MODEL } from "./ai";
+import { ai, withRetry, CHAT_MODEL } from "./ai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -165,21 +165,25 @@ const REMEMBER_TOOL: ChatCompletionTool = {
  *  plus one retry with a nudge when parsing still fails. Returns null on failure. */
 async function chatJson(system: string, user: string): Promise<unknown | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await ai().chat.completions.create({
-      model: CHAT_MODEL,
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        {
-          role: "user",
-          content:
-            attempt === 0
-              ? user
-              : user + "\n\n(Previous reply was not valid JSON — output ONLY the JSON object.)",
-        },
-      ],
-    });
+    const res = await withRetry(
+      () =>
+        ai().chat.completions.create({
+          model: CHAT_MODEL,
+          temperature: 0,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: system },
+            {
+              role: "user",
+              content:
+                attempt === 0
+                  ? user
+                  : user + "\n\n(Previous reply was not valid JSON — output ONLY the JSON object.)",
+            },
+          ],
+        }),
+      { label: "chatJson" }
+    );
     try {
       return JSON.parse(res.choices[0]?.message?.content ?? "");
     } catch {
@@ -408,13 +412,19 @@ ${ctx.text}`;
   // 🧠 The `remember` tool rides on this very call — the reply stream may carry
   // tool_call deltas alongside (or instead of) content. route.ts accumulates and
   // persists them; requestMessages is returned so the tool loop can be closed.
-  const stream = await ai().chat.completions.create({
-    model: CHAT_MODEL,
-    stream: true,
-    tools: [REMEMBER_TOOL],
-    tool_choice: "auto",
-    messages: requestMessages,
-  });
+  // R4: stream CREATION is retried (a 429 here used to kill the reply outright);
+  // mid-stream drops are still handled by the route's error marker.
+  const stream = await withRetry(
+    () =>
+      ai().chat.completions.create({
+        model: CHAT_MODEL,
+        stream: true,
+        tools: [REMEMBER_TOOL],
+        tool_choice: "auto",
+        messages: requestMessages,
+      }),
+    { label: "chat" }
+  );
   return { stream, recalled: ctx.ids, recalledNames: ctx.names, requestMessages };
 }
 
@@ -561,26 +571,30 @@ export async function continueChat(
     type: "function" as const,
     function: { name: tc.name, arguments: tc.arguments },
   }));
-  return ai().chat.completions.create({
-    model: CHAT_MODEL,
-    stream: true,
-    // One-shot retry: re-attach the remember tool only when a save failed.
-    // The route never runs a phase 3, so the loop cannot recurse.
-    ...(allowRememberRetry
-      ? { tools: [REMEMBER_TOOL], tool_choice: "auto" as const }
-      : {}),
-    messages: [
-      ...requestMessages,
-      { role: "assistant", content: null, tool_calls: calls },
-      ...calls.map(
-        (c, i): ChatCompletionMessageParam => ({
-          role: "tool",
-          tool_call_id: c.id,
-          content: results[i] ?? "✓ Saved to long-term memory.",
-        })
-      ),
-    ],
-  });
+  return withRetry(
+    () =>
+      ai().chat.completions.create({
+        model: CHAT_MODEL,
+        stream: true,
+        // One-shot retry: re-attach the remember tool only when a save failed.
+        // The route never runs a phase 3, so the loop cannot recurse.
+        ...(allowRememberRetry
+          ? { tools: [REMEMBER_TOOL], tool_choice: "auto" as const }
+          : {}),
+        messages: [
+          ...requestMessages,
+          { role: "assistant", content: null, tool_calls: calls },
+          ...calls.map(
+            (c, i): ChatCompletionMessageParam => ({
+              role: "tool",
+              tool_call_id: c.id,
+              content: results[i] ?? "✓ Saved to long-term memory.",
+            })
+          ),
+        ],
+      }),
+    { label: "continueChat" }
+  );
 }
 
 /** 🌙 Safety-net extraction over a conversation stretch — catches lasting facts
@@ -710,13 +724,17 @@ export async function answerQuestion(question: string) {
   // second identical embedding + scan for the same answer.
   const [answerMd, ctx] = await Promise.all([brain("answer.md"), buildContext(question)]);
 
-  const res = await ai().chat.completions.create({
-    model: CHAT_MODEL,
-    messages: [
-      { role: "system", content: answerMd },
-      { role: "user", content: `Context:\n${ctx.text}\n\nQuestion: ${question}` },
-    ],
-  });
+  const res = await withRetry(
+    () =>
+      ai().chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          { role: "system", content: answerMd },
+          { role: "user", content: `Context:\n${ctx.text}\n\nQuestion: ${question}` },
+        ],
+      }),
+    { label: "ask" }
+  );
 
   return {
     answer: res.choices[0]?.message?.content ?? "",
