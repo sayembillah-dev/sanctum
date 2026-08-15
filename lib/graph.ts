@@ -894,15 +894,26 @@ export async function recentNegativeFeedback(take = 10) {
  *  columns (created_at, valid_from/valid_to) already store this history, so the
  *  feature is pure read-path. */
 export async function graphSnapshot(asOf?: string) {
-  const day = asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? asOf : null;
-  const endOfDay = day ? new Date(`${day}T23:59:59.999`) : null;
+  // asOf: "YYYY-MM-DD" (end of that day) or a full ISO timestamp — minute-level
+  // granularity keeps the timelapse meaningful even when the whole graph is only
+  // a few hours old. (valid_from/valid_to are date-granular, so things forgotten
+  // *today* don't reappear within today's replay — that's the resolution limit.)
+  let t: Date | null = null;
+  if (asOf) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(asOf)) t = new Date(`${asOf}T23:59:59.999`);
+    else {
+      const p = new Date(asOf);
+      if (!Number.isNaN(+p)) t = p;
+    }
+  }
+  const day = t ? t.toISOString().slice(0, 10) : null;
   // Conversation digests stay in recall but never render in the cosmos
   const nodes = await prisma.node.findMany({
-    where: day
+    where: t
       ? {
           type: { not: "Conversation" },
-          created_at: { lte: endOfDay! },
-          OR: [{ valid_to: null }, { valid_to: { gt: asDate(day) } }],
+          created_at: { lte: t },
+          OR: [{ valid_to: null }, { valid_to: { gt: asDate(day!) } }],
         }
       : { valid_to: null, type: { not: "Conversation" } },
     orderBy: { created_at: "asc" },
@@ -911,12 +922,12 @@ export async function graphSnapshot(asOf?: string) {
   const ids = new Set(nodes.map((n) => n.id));
   const edges = (
     await prisma.edge.findMany({
-      where: day
+      where: t
         ? {
-            created_at: { lte: endOfDay! },
+            created_at: { lte: t },
             AND: [
-              { OR: [{ valid_from: null }, { valid_from: { lte: asDate(day) } }] },
-              { OR: [{ valid_to: null }, { valid_to: { gt: asDate(day) } }] },
+              { OR: [{ valid_from: null }, { valid_from: { lte: asDate(day!) } }] },
+              { OR: [{ valid_to: null }, { valid_to: { gt: asDate(day!) } }] },
             ],
           }
         : { valid_to: null },
@@ -924,8 +935,8 @@ export async function graphSnapshot(asOf?: string) {
     })
   ).filter((e) => ids.has(e.src_id) && ids.has(e.dst_id));
   return {
-    // `day` feeds the time-travel slider's earliest date
-    nodes: nodes.map((n) => ({ ...n, day: n.created_at.toISOString().slice(0, 10) })),
+    // `created` (full ISO) feeds the timelapse slider's earliest point
+    nodes: nodes.map((n) => ({ ...n, created: n.created_at.toISOString() })),
     links: edges.map((e) => ({ source: e.src_id, target: e.dst_id, type: e.type })),
   };
 }

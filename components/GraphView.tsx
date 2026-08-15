@@ -58,7 +58,7 @@ type GNode = {
   name: string;
   pinned?: boolean;
   mention_count?: number;
-  day?: string; // created date (YYYY-MM-DD) — feeds the time-travel slider
+  created?: string; // created_at ISO — feeds the timelapse slider range
   x?: number;
   y?: number;
 };
@@ -88,18 +88,26 @@ export default function GraphView() {
   const births = useRef<Map<string, number>>(new Map()); // node id → first-seen ts (bloom-in)
 
   // ── 🕰️ time-travel ───────────────────────────────────────────────────
-  // asOf = null → live graph; a date → the cosmos as it was that day.
-  const [asOf, setAsOf] = useState<string | null>(null);
-  const asOfRef = useRef<string | null>(null);
+  // asOf = null → live graph; otherwise the cosmos as it was at that moment.
+  // Minute resolution — the timelapse stays meaningful even when the whole
+  // graph was born a few hours ago.
+  const [asOf, setAsOf] = useState<number | null>(null); // epoch minutes
+  const asOfRef = useRef<string | null>(null); // ISO string for the API
   const travelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const firstDayEver = useRef<string | null>(null); // earliest node day ever seen (stable slider range)
-  const today = new Date().toLocaleDateString("en-CA");
-  const dayToInt = (d: string) => Math.round(Date.parse(`${d}T00:00:00Z`) / 864e5);
-  const intToDay = (i: number) => new Date(i * 864e5).toISOString().slice(0, 10);
+  const [minTs, setMinTs] = useState<number | null>(null); // earliest node ts ever seen (stable range)
+  const nowMin = () => Math.floor(Date.now() / 60000);
+  const minTsMin = minTs === null ? null : Math.floor(minTs / 60000);
+  const fmtMin = (m: number) => {
+    const d = new Date(m * 60000);
+    const sameDay = d.toLocaleDateString("en-CA") === new Date().toLocaleDateString("en-CA");
+    return sameDay
+      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString("en-CA");
+  };
 
-  const travel = (d: string | null) => {
-    asOfRef.current = d;
-    setAsOf(d);
+  const travel = (m: number | null) => {
+    asOfRef.current = m === null ? null : new Date(m * 60000).toISOString();
+    setAsOf(m);
     // debounce — dragging the slider fires a stream of changes
     if (travelTimer.current) clearTimeout(travelTimer.current);
     travelTimer.current = setTimeout(() => load(), 180);
@@ -117,13 +125,13 @@ export default function GraphView() {
 
   const play = () => {
     if (playing) return stopPlay();
-    if (!firstDayEver.current) return;
-    const start = dayToInt(firstDayEver.current);
-    const end = dayToInt(today);
+    if (minTsMin === null) return;
+    const start = minTsMin;
+    const end = nowMin();
     const step = Math.max(1, Math.ceil((end - start) / 60)); // ≤ ~60 frames total
     let cur = start;
     setPlaying(true);
-    travel(intToDay(cur));
+    travel(cur);
     playRef.current = setInterval(() => {
       cur += step;
       if (cur >= end) {
@@ -131,7 +139,7 @@ export default function GraphView() {
         travel(null); // land back on the live graph
         return;
       }
-      travel(intToDay(cur));
+      travel(cur);
     }, 650);
   };
 
@@ -234,12 +242,13 @@ export default function GraphView() {
   // ── data loading (dirty-window polling after activity) ───────────────────
   const load = async () => {
     try {
-      const q = asOfRef.current ? `?as_of=${asOfRef.current}` : "";
+      const q = asOfRef.current ? `?as_of=${encodeURIComponent(asOfRef.current)}` : "";
       const r = await fetch(`/api/graph${q}`, { cache: "no-store" });
       const d = (await r.json()) as GData;
       for (const n of d.nodes) {
-        if (n.day && (!firstDayEver.current || n.day < firstDayEver.current)) {
-          firstDayEver.current = n.day; // slider range never shrinks while traveling
+        if (n.created) {
+          const ts = new Date(n.created).getTime();
+          setMinTs((prev) => (prev === null || ts < prev ? ts : prev)); // range never shrinks
         }
       }
       const nextSig =
@@ -446,8 +455,10 @@ export default function GraphView() {
         {data.nodes.length} neurons · {data.links.length} synapses
       </div>
 
-      {/* 🕰️ time-travel — scrub the cosmos back through its history */}
-      {firstDayEver.current && firstDayEver.current < today && (
+      {/* 🕰️ time-travel — scrub the cosmos back through its history.
+          Always visible once the graph loads (minute resolution works even
+          when every node was created today). */}
+      {minTsMin !== null && data.nodes.length > 0 && (
         <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur">
           <button
             onClick={play}
@@ -465,25 +476,25 @@ export default function GraphView() {
           </span>
           <input
             type="range"
-            aria-label="Travel to a past day"
+            aria-label="Travel to a past moment"
             className="h-1 w-40 cursor-pointer accent-indigo-400"
-            min={dayToInt(firstDayEver.current)}
-            max={dayToInt(today)}
-            value={dayToInt(asOf ?? today)}
+            min={minTsMin}
+            max={nowMin()}
+            value={asOf ?? nowMin()}
             onChange={(e) => {
               stopPlay(); // manual scrub wins over playback
-              const d = intToDay(Number(e.target.value));
-              travel(d === today ? null : d);
+              const v = Number(e.target.value);
+              travel(v >= nowMin() ? null : v);
             }}
           />
           <span
             className={`min-w-[4.5rem] text-center text-[11px] tabular-nums ${
-              asOf ? "text-amber-300" : "text-slate-400"
+              asOf !== null ? "text-amber-300" : "text-slate-400"
             }`}
           >
-            {asOf ?? "now"}
+            {asOf === null ? "now" : fmtMin(asOf)}
           </span>
-          {asOf && (
+          {asOf !== null && (
             <button
               onClick={() => travel(null)}
               className="rounded-full border border-amber-300/30 px-2 py-0.5 text-[10px] text-amber-300 transition hover:bg-amber-400/10"
