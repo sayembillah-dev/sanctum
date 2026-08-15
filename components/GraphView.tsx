@@ -171,11 +171,11 @@ export default function GraphView() {
     if (!fg) return;
     // Obsidian-like balance: mild center pull forms a round constellation,
     // bounded repulsion + uniform link length keep nodes clean and separate
-    fg.d3Force?.("charge")?.strength?.(-220);
-    fg.d3Force?.("link")?.distance?.(110);
-    fg.d3Force?.("center")?.strength?.(0.14);
-    fg.d3Force?.("charge")?.distanceMax?.(450);
-    const collide = forceCollide((n: any) => 20 + (degrees.get(n.id) ?? 0) * 1.4);
+    fg.d3Force?.("charge")?.strength?.(-420);
+    fg.d3Force?.("link")?.distance?.(150);
+    fg.d3Force?.("center")?.strength?.(0.1);
+    fg.d3Force?.("charge")?.distanceMax?.(700);
+    const collide = forceCollide((n: any) => 30 + (degrees.get(n.id) ?? 0) * 1.8);
     collide.strength?.(0.5); // gentle overlap resolution — no violent push-back
     fg.d3Force?.("collide", collide);
   }, [degrees]);
