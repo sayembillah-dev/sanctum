@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "node scripts/migrate.mjs && next dev",
-    "build": "next build",
+    "build": "set DIST_DIR=.next-build&& next build",
     "start": "next start",
     "postinstall": "prisma generate",
     "db:migrate": "node scripts/migrate.mjs",
