@@ -3,6 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 
 type Msg = { role: "user" | "assistant"; content: string };
+type Task = {
+  id: string;
+  name: string;
+  due: string | null;
+  status: string;
+  overdue: boolean;
+  mention_count: number;
+};
 type Recap = {
   newNodes: number;
   newEdges: number;
@@ -22,6 +30,7 @@ export default function Chat() {
   const [fb, setFb] = useState<Record<number, 1 | -1>>({}); // msg index → rating given
   const [recap, setRecap] = useState<Recap | "loading" | null>(null);
   const [title, setTitle] = useState<string | null>(null); // 🏷️ X5 session title
+  const [tasks, setTasks] = useState<Task[] | "loading" | null>(null); // ✅ tasks overlay
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -163,6 +172,43 @@ export default function Chat() {
     }
   }
 
+  // ✅ tasks view — the memory graph's Task nodes, toggled from the UI.
+  // Toggling writes attrs.status through the same path the extractor uses,
+  // so open loops, recall and the cosmos all stay in sync.
+  async function loadTasks() {
+    setTasks("loading");
+    try {
+      const r = await fetch("/api/tasks", { cache: "no-store" });
+      const d = await r.json();
+      setTasks(Array.isArray(d.tasks) ? d.tasks : []);
+    } catch {
+      setTasks(null);
+    }
+  }
+
+  async function toggleTask(t: Task) {
+    const done = t.status === "open";
+    // optimistic flip
+    setTasks((prev) =>
+      Array.isArray(prev)
+        ? prev.map((x) => (x.id === t.id ? { ...x, status: done ? "done" : "open", overdue: false } : x))
+        : prev
+    );
+    try {
+      await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: t.id, done }),
+      });
+      window.dispatchEvent(new Event("sanctum:dirty"));
+    } catch {
+      /* revert on failure */
+      setTasks((prev) =>
+        Array.isArray(prev) ? prev.map((x) => (x.id === t.id ? t : x)) : prev
+      );
+    }
+  }
+
   const waiting =
     busy && messages.at(-1)?.role === "assistant" && !messages.at(-1)?.content;
 
@@ -176,6 +222,13 @@ export default function Chat() {
           className="absolute left-3 top-3 z-10 rounded-full border border-white/10 bg-[#0a0a18]/80 px-3 py-1.5 text-[11px] text-slate-400 backdrop-blur-md transition hover:border-amber-300/40 hover:text-amber-300"
         >
           ✨ Week
+        </button>
+        <button
+          onClick={loadTasks}
+          title="Tasks Sanctum is tracking for you"
+          className="absolute left-[5.75rem] top-3 z-10 rounded-full border border-white/10 bg-[#0a0a18]/80 px-3 py-1.5 text-[11px] text-slate-400 backdrop-blur-md transition hover:border-emerald-300/40 hover:text-emerald-300"
+        >
+          ✅ Tasks
         </button>
         {/* 🏷️ session title — instant slice first, LLM-upgraded as the conversation grows */}
         {title && (
@@ -290,6 +343,80 @@ export default function Chat() {
                         <span className="text-slate-600"> · {recap.latestDigest.date}</span>
                       </p>
                     </>
+                  )}
+                  <p className="mt-4 text-center text-[10px] text-slate-600">tap outside to close</p>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ✅ tasks overlay — the graph's Task nodes as a checklist */}
+        {tasks !== null && (
+          <div
+            className="absolute inset-0 z-20 flex items-center justify-center bg-[#05050f]/70 p-4 backdrop-blur-sm"
+            onClick={() => setTasks(null)}
+          >
+            <div
+              className="msg-in max-h-full w-full max-w-[330px] overflow-y-auto rounded-2xl border border-white/10 bg-[#0a0a18]/95 p-4 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {tasks === "loading" ? (
+                <p className="py-6 text-center text-xs text-slate-500">gathering loops…</p>
+              ) : (
+                <>
+                  <h3 className="font-display text-sm font-semibold text-white">✅ Tasks</h3>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {tasks.filter((t) => t.status === "open").length} open ·{" "}
+                    {tasks.filter((t) => t.overdue).length} overdue
+                  </p>
+                  {tasks.length === 0 ? (
+                    <p className="mt-4 text-center text-[11px] leading-relaxed text-slate-500">
+                      No tasks yet — mention one in chat
+                      <br />
+                      <span className="text-slate-600">
+                        (“remind me to fix the sign-in API by Friday”)
+                      </span>
+                    </p>
+                  ) : (
+                    <ul className="mt-3 space-y-1.5">
+                      {tasks.map((t) => {
+                        const open = t.status === "open";
+                        return (
+                          <li key={t.id} className="flex items-start gap-2.5">
+                            <button
+                              onClick={() => toggleTask(t)}
+                              aria-label={open ? "Mark done" : "Reopen"}
+                              className={`mt-0.5 grid h-4 w-4 flex-none place-items-center rounded-md border transition active:scale-90 ${
+                                open
+                                  ? "border-white/25 hover:border-emerald-300/60"
+                                  : "border-emerald-400/50 bg-emerald-500/20 text-emerald-300"
+                              }`}
+                            >
+                              {!open && (
+                                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M20 6 9 17l-5-5" />
+                                </svg>
+                              )}
+                            </button>
+                            <div className="min-w-0 flex-1">
+                              <p
+                                className={`text-[12px] leading-snug ${
+                                  open ? "text-slate-200" : "text-slate-500 line-through"
+                                }`}
+                              >
+                                {t.name}
+                              </p>
+                              {t.due && (
+                                <p className={`text-[10px] ${t.overdue ? "text-rose-400" : "text-slate-600"}`}>
+                                  {t.overdue ? `overdue ${t.due}` : open ? `due ${t.due}` : `was due ${t.due}`}
+                                </p>
+                              )}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
                   )}
                   <p className="mt-4 text-center text-[10px] text-slate-600">tap outside to close</p>
                 </>

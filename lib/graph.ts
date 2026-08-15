@@ -630,6 +630,72 @@ export async function openLoops(): Promise<OpenLoop[]> {
   return loops.sort((x, y) => (x.due ?? "9999").localeCompare(y.due ?? "9999")).slice(0, 6);
 }
 
+// ── Tasks view: the memory graph's Task nodes as an actionable list ────────
+
+export type TaskItem = {
+  id: string;
+  name: string;
+  due: string | null;
+  status: string; // 'open' | 'done' | …
+  overdue: boolean;
+  mention_count: number;
+};
+
+/** All live Task nodes — open first (earliest due first), closed at the bottom. */
+export async function listTasks(): Promise<TaskItem[]> {
+  const rows = await prisma.$queryRaw<
+    { id: string; name: string; attrs: unknown; mention_count: number }[]
+  >`
+    select id::text as id, name, attrs, mention_count from nodes
+    where valid_to is null and lower(type) = 'task'
+    order by created_at desc limit 200`;
+  const t = today();
+  const items = rows.map((r) => {
+    const a = (r.attrs ?? {}) as Record<string, unknown>;
+    const raw = typeof a.due === "string" ? a.due : null;
+    const due = raw && /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null;
+    const status = typeof a.status === "string" ? a.status.toLowerCase() : "open";
+    const closed = ["done", "completed", "cancelled", "closed"].includes(status);
+    return {
+      id: r.id,
+      name: r.name,
+      due,
+      status: closed ? status : "open",
+      overdue: !closed && !!due && due < t,
+      mention_count: r.mention_count,
+    };
+  });
+  return items.sort(
+    (x, y) =>
+      (x.status === "open" ? 0 : 1) - (y.status === "open" ? 0 : 1) ||
+      (x.due ?? "9999").localeCompare(y.due ?? "9999")
+  );
+}
+
+/** Toggle a task done/open from the UI. Writes attrs.status (+ done_on stamp) and
+ *  re-embeds — "done" shifts meaning (the task drops out of open loops). */
+export async function setTaskStatus(
+  id: string,
+  done: boolean
+): Promise<{ id: string; name: string; status: string } | null> {
+  const row = await prisma.node.findFirst({ where: { id, valid_to: null } });
+  if (!row || row.type.toLowerCase() !== "task") return null;
+  const newAttrs = {
+    ...((row.attrs as Record<string, unknown> | null) ?? {}),
+    status: done ? "done" : "open",
+    ...(done ? { done_on: today() } : {}),
+  };
+  const vector = lit(await embed(embedNodeText(row.type, row.name, newAttrs)));
+  await prisma.$transaction([
+    prisma.node.update({
+      where: { id },
+      data: { attrs: newAttrs as Prisma.InputJsonValue, updated_at: new Date() },
+    }),
+    prisma.$executeRaw`update nodes set embedding = ${vector}::vector where id = ${id}::uuid`,
+  ]);
+  return { id, name: row.name, status: String(newAttrs.status) };
+}
+
 /** Crystallize a conversation into a graph-visible digest node, linked to everything it touched. */
 export async function createDigest(d: {
   summary: string;
