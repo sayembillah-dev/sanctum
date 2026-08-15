@@ -26,6 +26,7 @@ import {
   recentNegativeFeedback,
   PROFILE_NAME,
 } from "./graph";
+import { scanMemoryContent } from "./guard";
 
 // The brain is markdown — code enforces invariants, markdown guides judgment.
 // Cached by mtime: editing a brain file is picked up on the next call, but we no
@@ -532,6 +533,15 @@ export async function applyRemembered(sourceText: string, argsJson: string) {
   const parsed = Extraction.safeParse(raw);
   if (!parsed.success) {
     return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
+  }
+  // Hermes threat scan (tools/threat_patterns.py, strict subset): remembered
+  // content is later injected into the system prompt — a stored injection is a
+  // persistent jailbreak, a stored credential a lasting leak. Refuse poisoned
+  // writes; the truthful ✗ result lets the model self-correct (see route.ts).
+  const threat = scanMemoryContent(JSON.stringify(parsed.data));
+  if (threat) {
+    console.warn("🧠 remember blocked by content scan:", threat);
+    return { ok: false as const, error: `memory write blocked by content scan (${threat})` };
   }
   const r = await applyExtraction(sourceText, parsed.data, []);
   return { ok: true as const, ...r };
