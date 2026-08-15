@@ -47,7 +47,7 @@ const normOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
 const dot = (x: number[], y: number[]) => x.reduce((s, v, i) => s + v * y[i], 0); // embeddings are unit-norm → dot = cosine
 
 type ExtractedNode = { type: string; name: string; attrs: Record<string, unknown> };
-type ExtractedEdge = { src: string; dst: string; type: string; said_on?: string };
+type ExtractedEdge = { src: string; dst: string; type: string; said_on?: string; due_by?: string };
 
 /**
  * Batch-persist one extraction atomically: dump row + node resolution/creation + edges.
@@ -86,6 +86,75 @@ export async function persistExtraction(
   // Embed everything unresolved in ONE HTTP call — before the transaction opens.
   const rawVecs = await embedBatch(unresolved.map((n) => embedNodeText(n.type, n.name, n.attrs)));
   const vectors = rawVecs.map(lit);
+
+  // Edge endpoints that are neither in `known` nor extracted in this dump used to
+  // fall back to per-name findNode INSIDE the transaction — up to 3 sequential
+  // round trips per endpoint while holding a DB connection. Batch-resolve them
+  // here, before the tx opens (exact → normalized → embedding-similar, same order
+  // as findNode so behavior is identical).
+  const extractedNames = new Set(
+    uniqueNodes.flatMap((n) => [n.name.trim().toLowerCase(), normOf(n.name)])
+  );
+  const dangling = new Map<string, string>(); // lowered name → original
+  for (const e of edges) {
+    for (const nm of [e.src, e.dst]) {
+      const k = nm.trim().toLowerCase();
+      if (
+        idByName.has(k) ||
+        idByName.has(normOf(nm)) ||
+        extractedNames.has(k) ||
+        extractedNames.has(normOf(nm))
+      )
+        continue;
+      dangling.set(k, nm);
+    }
+  }
+  if (dangling.size) {
+    const names = [...dangling.values()];
+    // 1) batched case-insensitive exact match
+    const exactRows = await prisma.node.findMany({
+      where: {
+        valid_to: null,
+        OR: names.map((nm) => ({ name: { equals: nm, mode: "insensitive" as const } })),
+      },
+      select: { id: true, name: true },
+    });
+    for (const r of exactRows) setKeys(r.name, r.id);
+    // 2) batched normalized-name match for what exact missed
+    const normMisses = names.filter(
+      (nm) => !idByName.has(nm.trim().toLowerCase()) && !idByName.has(normOf(nm))
+    );
+    if (normMisses.length) {
+      const rows = await prisma.$queryRaw<{ id: string; norm: string }[]>`
+        select id::text as id, regexp_replace(lower(name), '[^a-z0-9]+', '', 'g') as norm
+        from nodes
+        where valid_to is null
+          and regexp_replace(lower(name), '[^a-z0-9]+', '', 'g') in (${Prisma.join(
+            normMisses.map((nm) => normOf(nm))
+          )})`;
+      const byNorm = new Map(rows.map((r) => [r.norm, r.id]));
+      for (const nm of normMisses) {
+        const hit = byNorm.get(normOf(nm));
+        if (hit) setKeys(nm, hit);
+      }
+    }
+    // 3) embedding-similarity for the remainder — one batched embed, top-1 each.
+    //    Bare-name embed, same as findNode (name tokens dominate node vectors).
+    const simMisses = names.filter(
+      (nm) => !idByName.has(nm.trim().toLowerCase()) && !idByName.has(normOf(nm))
+    );
+    if (simMisses.length) {
+      const vecs = (await embedBatch(simMisses)).map(lit);
+      for (let i = 0; i < simMisses.length; i++) {
+        const sim = await prisma.$queryRaw<{ id: string }[]>`
+          select id::text as id from nodes
+          where embedding is not null and valid_to is null
+            and 1 - (embedding <=> ${vecs[i]}::vector) >= ${DEDUP_THRESHOLD}
+          order by embedding <=> ${vecs[i]}::vector limit 1`;
+        if (sim[0]) setKeys(simMisses[i], sim[0].id);
+      }
+    }
+  }
 
   return prisma.$transaction(
     async (tx) => {
@@ -182,8 +251,8 @@ export async function persistExtraction(
         }
       }
 
-      // Edges: resolve endpoints (findNode fallback for names neither known nor
-      // extracted), skip self-loops, then race-safe INSERT … ON CONFLICT DO NOTHING.
+      // Edges: endpoints were batch-resolved pre-tx (findNode stays as a safety
+      // net that should never fire); skip self-loops; race-safe ON CONFLICT.
       let edgesCreated = 0;
       for (const e of edges) {
         let srcId = idByName.get(e.src.trim().toLowerCase()) ?? idByName.get(normOf(e.src));
@@ -197,6 +266,16 @@ export async function persistExtraction(
           on conflict do nothing
           returning id::text as id`;
         if (ins.length) edgesCreated++;
+        // Honor due_by: fold the deadline onto the destination node's attrs.due —
+        // openLoops() reads task deadlines from node attrs. The extraction schema
+        // offers due_by on edges; it used to be silently dropped on the floor.
+        if (e.due_by) {
+          await tx.$executeRaw`
+            update nodes
+            set attrs = jsonb_set(coalesce(attrs, '{}'::jsonb), '{due}', to_jsonb(${e.due_by}::text), true),
+                updated_at = now()
+            where id = ${dstId}::uuid and valid_to is null`;
+        }
       }
 
       return { dumpId: dump.id, created, reused, edgesCreated };
@@ -211,15 +290,18 @@ export async function persistExtraction(
  * a concurrent extraction inserting the same edge hits ON CONFLICT DO NOTHING
  * instead of silently doubling. Returns true if a new edge was actually created.
  */
-export async function createEdge(e: {
-  srcId: string;
-  dstId: string;
-  type: string;
-  saidOn?: string;
-  dumpId?: string;
-}): Promise<boolean> {
+export async function createEdge(
+  e: {
+    srcId: string;
+    dstId: string;
+    type: string;
+    saidOn?: string;
+    dumpId?: string;
+  },
+  db: Prisma.TransactionClient | typeof prisma = prisma // pass a tx to join an atomic unit (mergeNodes)
+): Promise<boolean> {
   if (e.srcId === e.dstId) return false; // no self-loops
-  const ins = await prisma.$queryRaw<{ id: string }[]>`
+  const ins = await db.$queryRaw<{ id: string }[]>`
     insert into edges (src_id, dst_id, type, said_on, valid_from, source_dump_id)
     values (${e.srcId}::uuid, ${e.dstId}::uuid, ${e.type}, ${e.saidOn ?? null}::date, ${e.saidOn ?? null}::date, ${e.dumpId ?? null}::uuid)
     on conflict do nothing
@@ -245,11 +327,15 @@ export async function updateNode(
     ...(u.setAttrs ?? {}),
   };
   const vector = lit(await embed(embedNodeText(row.type, newName, newAttrs)));
-  await prisma.node.update({
-    where: { id },
-    data: { name: newName, attrs: newAttrs as Prisma.InputJsonValue, updated_at: new Date() },
-  });
-  await prisma.$executeRaw`update nodes set embedding = ${vector}::vector where id = ${id}::uuid`;
+  // Atomic: attrs/rename and the fresh embedding land together or not at all —
+  // the old two-statement path could leave a stale vector on fresh attrs.
+  await prisma.$transaction([
+    prisma.node.update({
+      where: { id },
+      data: { name: newName, attrs: newAttrs as Prisma.InputJsonValue, updated_at: new Date() },
+    }),
+    prisma.$executeRaw`update nodes set embedding = ${vector}::vector where id = ${id}::uuid`,
+  ]);
   return { id, name: newName };
 }
 
@@ -281,6 +367,44 @@ export async function forgetNode(name: string): Promise<{ id: string; name: stri
     data: { valid_to: asDate(today()) },
   });
   return { id, name };
+}
+
+/** Forget by id — the graph inspector's Forget button. The pinned profile node
+ *  (the ☀️ of the cosmos) can never be forgotten through this path. */
+export async function forgetNodeById(id: string): Promise<{ id: string; name: string } | null> {
+  const node = await prisma.node.findUnique({
+    where: { id },
+    select: { id: true, name: true, pinned: true, valid_to: true },
+  });
+  if (!node || node.valid_to || node.pinned) return null;
+  await prisma.node.update({ where: { id }, data: { valid_to: asDate(today()) } });
+  await prisma.edge.updateMany({
+    where: { OR: [{ src_id: id }, { dst_id: id }], valid_to: null },
+    data: { valid_to: asDate(today()) },
+  });
+  return { id, name: node.name };
+}
+
+/** Node inspector payload: the node itself plus its active neighborhood (names resolved). */
+export async function nodeDetail(id: string) {
+  const node = await prisma.node.findFirst({
+    where: { id, valid_to: null },
+    select: {
+      id: true,
+      type: true,
+      name: true,
+      attrs: true,
+      pinned: true,
+      mention_count: true,
+      recall_used_count: true,
+      last_recalled_at: true,
+      created_at: true,
+      updated_at: true,
+    },
+  });
+  if (!node) return null;
+  const edges = await nodeEdges([id], 60);
+  return { node, edges };
 }
 
 /** Most recently created live nodes — gives the extractor awareness of the current graph. */
@@ -400,20 +524,71 @@ export async function markRecallUsed(ids: string[]) {
   });
 }
 
+// ── Conversation persistence (005): chat history is server-side now ──────────
+// The thread survives refreshes, and the digest cadence counts PERSISTED
+// messages instead of whatever array the client happened to send.
+
+/** Get-or-create the current chat session id (single-user prototype: one app_state row). */
+export async function currentSessionId(): Promise<string> {
+  const row = await prisma.appState.findUnique({ where: { key: "current_session" } });
+  if (typeof row?.value === "string" && row.value) return row.value;
+  return rotateSession();
+}
+
+/** Start a fresh session (clear-chat). The old session's messages stay in the DB. */
+export async function rotateSession(): Promise<string> {
+  const id = crypto.randomUUID();
+  await prisma.appState.upsert({
+    where: { key: "current_session" },
+    update: { value: id },
+    create: { key: "current_session", value: id },
+  });
+  return id;
+}
+
+export async function appendChatMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string
+) {
+  if (!content.trim()) return;
+  await prisma.chatMessage.create({ data: { session_id: sessionId, role, content } });
+}
+
+/** Recent messages of a session, oldest-first — chat context + digest stretches. */
+export async function recentChatMessages(sessionId: string, limit = 40) {
+  const rows = await prisma.chatMessage.findMany({
+    where: { session_id: sessionId },
+    orderBy: { created_at: "desc" },
+    take: limit,
+    select: { role: true, content: true },
+  });
+  return rows
+    .reverse()
+    .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+}
+
+/** Digest cadence source of truth: persisted message count for the session. */
+export async function sessionMessageCount(sessionId: string): Promise<number> {
+  return prisma.chatMessage.count({ where: { session_id: sessionId } });
+}
+
 export type OpenLoop = { name: string; due: string | null; overdue: boolean };
 
 /** Unresolved threads: live tasks that aren't done — overdue/near-due first. Capped. */
 export async function openLoops(): Promise<OpenLoop[]> {
-  const tasks = await prisma.node.findMany({
-    where: { valid_to: null, type: { equals: "Task", mode: "insensitive" } },
-    select: { name: true, attrs: true },
-  });
+  // Status filter lives in SQL — this runs on EVERY chat message, so fetching
+  // every task ever (including long-done ones) and filtering in JS didn't scale.
+  const tasks = await prisma.$queryRaw<{ name: string; attrs: unknown }[]>`
+    select name, attrs from nodes
+    where valid_to is null and lower(type) = 'task'
+      and lower(coalesce(attrs->>'status', '')) not in ('done', 'completed', 'cancelled', 'closed')
+    order by created_at desc
+    limit 100`;
   const t = today();
   const loops: OpenLoop[] = [];
   for (const task of tasks) {
     const a = (task.attrs ?? {}) as Record<string, unknown>;
-    const status = String(a.status ?? "").toLowerCase();
-    if (["done", "completed", "cancelled", "closed"].includes(status)) continue;
     const raw = typeof a.due === "string" ? a.due : null;
     const due = raw && /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null;
     loops.push({ name: task.name, due, overdue: !!due && due < t });
@@ -462,10 +637,12 @@ export async function addFeedback(f: { rating: number; userMsg: string; assistan
   });
 }
 
-/** "What I learned this week" — growth made visible. */
+/** "What I learned this week" — growth made visible. Also carries the proactive
+ *  surface: open loops (what's outstanding) + the latest session digest (where
+ *  we left off) — the recap overlay doubles as a mini-briefing. */
 export async function weeklyRecap() {
   const since = new Date(Date.now() - 7 * 864e5);
-  const [nodes, edgeCount, fb, top] = await Promise.all([
+  const [nodes, edgeCount, fb, top, loops, latestDigest] = await Promise.all([
     prisma.node.findMany({
       where: { created_at: { gte: since }, valid_to: null },
       select: { type: true, name: true },
@@ -479,6 +656,12 @@ export async function weeklyRecap() {
       take: 5,
       select: { name: true, type: true, mention_count: true },
     }),
+    openLoops(),
+    prisma.node.findFirst({
+      where: { type: "Conversation", valid_to: null },
+      orderBy: { created_at: "desc" },
+      select: { name: true, attrs: true, created_at: true },
+    }),
   ]);
   const byType: Record<string, number> = {};
   for (const n of nodes) byType[n.type] = (byType[n.type] ?? 0) + 1;
@@ -489,6 +672,16 @@ export async function weeklyRecap() {
     newest: nodes.slice(0, 8).map((n) => ({ name: n.name, type: n.type })),
     topMentioned: top,
     feedback: { up: fb.find((f) => f.rating === 1)?._count ?? 0, down: fb.find((f) => f.rating === -1)?._count ?? 0 },
+    openLoops: loops,
+    latestDigest: latestDigest
+      ? {
+          name: latestDigest.name,
+          summary: String(
+            ((latestDigest.attrs as Record<string, unknown> | null) ?? {}).summary ?? ""
+          ),
+          date: latestDigest.created_at.toISOString().slice(0, 10),
+        }
+      : null,
   };
 }
 
@@ -519,43 +712,53 @@ export async function mergeNodes(keepId: string, dropId: string): Promise<boolea
   ]);
   if (!keep || !drop || keepId === dropId) return false;
 
-  const edges = await prisma.edge.findMany({
-    where: { OR: [{ src_id: dropId }, { dst_id: dropId }], valid_to: null },
-  });
-  for (const e of edges) {
-    const srcId = e.src_id === dropId ? keepId : e.src_id;
-    const dstId = e.dst_id === dropId ? keepId : e.dst_id;
-    if (srcId !== dstId) {
-      await createEdge({
-        srcId,
-        dstId,
-        type: e.type,
-        saidOn: e.said_on ? e.said_on.toISOString().slice(0, 10) : undefined,
-        dumpId: e.source_dump_id ?? undefined,
-      });
-    }
-  }
-
   const mergedAttrs = {
     ...((drop.attrs as Record<string, unknown> | null) ?? {}),
     ...((keep.attrs as Record<string, unknown> | null) ?? {}),
   };
+  // Embedding HTTP call stays OUTSIDE the transaction (no DB connection held).
   const vector = lit(await embed(embedNodeText(keep.type, keep.name, mergedAttrs)));
-  await prisma.node.update({
-    where: { id: keepId },
-    data: {
-      attrs: mergedAttrs as Prisma.InputJsonValue,
-      mention_count: keep.mention_count + drop.mention_count,
-      updated_at: new Date(),
-    },
-  });
-  await prisma.$executeRaw`update nodes set embedding = ${vector}::vector where id = ${keepId}::uuid`;
 
-  await prisma.node.update({ where: { id: dropId }, data: { valid_to: asDate(today()) } });
-  await prisma.edge.updateMany({
-    where: { OR: [{ src_id: dropId }, { dst_id: dropId }], valid_to: null },
-    data: { valid_to: asDate(today()) },
-  });
+  // Atomic: edge re-pointing + attr merge + re-embed + soft-close land together —
+  // the old path was 5+ independent statements; a crash mid-way left a half-merged graph.
+  await prisma.$transaction(
+    async (tx) => {
+      const edges = await tx.edge.findMany({
+        where: { OR: [{ src_id: dropId }, { dst_id: dropId }], valid_to: null },
+      });
+      for (const e of edges) {
+        const srcId = e.src_id === dropId ? keepId : e.src_id;
+        const dstId = e.dst_id === dropId ? keepId : e.dst_id;
+        if (srcId !== dstId) {
+          await createEdge(
+            {
+              srcId,
+              dstId,
+              type: e.type,
+              saidOn: e.said_on ? e.said_on.toISOString().slice(0, 10) : undefined,
+              dumpId: e.source_dump_id ?? undefined,
+            },
+            tx
+          );
+        }
+      }
+      await tx.node.update({
+        where: { id: keepId },
+        data: {
+          attrs: mergedAttrs as Prisma.InputJsonValue,
+          mention_count: keep.mention_count + drop.mention_count,
+          updated_at: new Date(),
+        },
+      });
+      await tx.$executeRaw`update nodes set embedding = ${vector}::vector where id = ${keepId}::uuid`;
+      await tx.node.update({ where: { id: dropId }, data: { valid_to: asDate(today()) } });
+      await tx.edge.updateMany({
+        where: { OR: [{ src_id: dropId }, { dst_id: dropId }], valid_to: null },
+        data: { valid_to: asDate(today()) },
+      });
+    },
+    { timeout: 15000 }
+  );
   return true;
 }
 
