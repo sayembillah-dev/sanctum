@@ -6,4 +6,5 @@ out/
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
-dev.log 
+dev.log
+HERMES_SOUCE_FILE/ 
