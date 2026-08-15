@@ -98,32 +98,36 @@ export default function GraphView() {
   // null → live full graph. Pure client-side slicing: no fetches, no clocks.
   const [cut, setCut] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
-  const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const playRef = useRef<number | null>(null); // rAF handle
   const prevVisible = useRef<Set<string>>(new Set());
 
   const stopPlay = () => {
-    if (playRef.current) clearInterval(playRef.current);
+    if (playRef.current !== null) cancelAnimationFrame(playRef.current);
     playRef.current = null;
     setPlaying(false);
   };
 
+  // Continuous reveal: rAF advances a fractional cut so neurons enter ONE at a
+  // time (~130ms each) instead of N/60 bursts — that's what makes it read as
+  // growth rather than chunks. setCut only re-renders when the integer changes.
   const play = () => {
     if (playing) return stopPlay();
     const total = data.nodes.length;
     if (total < 2) return;
-    const step = Math.max(1, Math.ceil(total / 60)); // ≤ ~60 frames
-    let cur = 1;
     setPlaying(true);
-    setCut(1);
-    playRef.current = setInterval(() => {
-      cur += step;
-      if (cur >= total) {
+    const t0 = performance.now();
+    const dur = Math.min(Math.max(total * 130, 2500), 20000);
+    const tick = () => {
+      const p = (performance.now() - t0) / dur;
+      if (p >= 1) {
         stopPlay();
         setCut(null); // land back on the live graph
         return;
       }
-      setCut(cur);
-    }, 350);
+      setCut(1 + Math.floor(p * (total - 1)));
+      playRef.current = requestAnimationFrame(tick);
+    };
+    playRef.current = requestAnimationFrame(tick);
   };
 
   // ── node inspector ─────────────────────────────────────────────────────
@@ -207,7 +211,6 @@ export default function GraphView() {
     const visible = new Set(nodes.map((n) => n.id));
     if (prevVisible.current.size > 0) {
       const now = performance.now();
-      let kicked = false;
       for (const n of nodes) {
         if (prevVisible.current.has(n.id) || n.x !== undefined) continue;
         births.current.set(n.id, now);
@@ -229,11 +232,10 @@ export default function GraphView() {
           n.fx = n.x;
           n.fy = n.y;
           pops.current.set(n.id, { ax: n.x, ay: n.y, ang: Math.random() * Math.PI * 2, t0: now });
-          kicked = true;
         }
       }
-      // wake the sim so nodes settle naturally once the tween releases them
-      if (kicked) queueMicrotask(() => fgRef.current?.d3ReheatSimulation?.());
+      // no reheat here — reheating on every entry pins the sim at full boil;
+      // the running sim settles released nodes gently on its own
     }
     prevVisible.current = visible;
     return {
@@ -344,7 +346,7 @@ export default function GraphView() {
       window.removeEventListener("sanctum:dirty", onDirty);
       window.removeEventListener("sanctum:recalled", onRecalled);
       clearInterval(t);
-      if (playRef.current) clearInterval(playRef.current);
+      if (playRef.current !== null) cancelAnimationFrame(playRef.current);
     };
   }, []);
 
