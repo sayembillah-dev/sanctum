@@ -402,13 +402,114 @@ ${ctx.text}`;
  *  was worth saving, so the gating cost already rode on the reply call. Validates
  *  + persists exactly like silent extraction; the known set stays empty —
  *  persistExtraction resolves names against the DB itself (exact → norm → vector). */
-export async function applyRemembered(sourceText: string, argsJson: string) {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(argsJson);
-  } catch {
-    return { ok: false as const, error: "tool arguments were not valid JSON" };
+/** Repair malformed streamed tool-call arguments before parsing.
+ *  Ported from Hermes `_repair_tool_call_arguments` (message_sanitization.py:195):
+ *  models streaming JSON args occasionally emit trailing commas, raw control
+ *  chars inside strings, or unbalanced closers. Progressive passes, each only
+ *  attempted while parsing still fails. Returns a parseable string, or null. */
+function repairToolArguments(argsJson: string): string | null {
+  const attempt = (text: string): string | null => {
+    try {
+      JSON.parse(text);
+      return text;
+    } catch {
+      return null;
+    }
+  };
+
+  const s = (argsJson ?? "").trim();
+  if (!s) return "{}"; // empty args = empty object
+  const direct = attempt(s);
+  if (direct !== null) return direct;
+
+  // Pass 1: strip trailing commas before } or ]
+  let t = s.replace(/,\s*([}\]])/g, "$1");
+  let ok = attempt(t);
+  if (ok !== null) return ok;
+
+  // Pass 2: escape raw control characters inside string literals
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (const ch of t) {
+    if (esc) {
+      out += ch;
+      esc = false;
+      continue;
+    }
+    if (ch === "\\" && inStr) {
+      out += ch;
+      esc = true;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      out += ch;
+      continue;
+    }
+    if (inStr && ch < " ") {
+      out += ch === "\n" ? "\\n" : ch === "\t" ? "\\t" : ch === "\r" ? "\\r" : "";
+      continue;
+    }
+    out += ch;
   }
+  t = out;
+  ok = attempt(t);
+  if (ok !== null) return ok;
+
+  // Pass 3: close an unterminated string, then append missing closers
+  if (inStr) t += '"';
+  const stack: string[] = [];
+  inStr = false;
+  esc = false;
+  for (const ch of t) {
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === "\\" && inStr) {
+      esc = true;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      continue;
+    }
+    if (inStr) continue;
+    if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  while (stack.length) t += stack.pop() === "{" ? "}" : "]";
+  ok = attempt(t);
+  if (ok !== null) return ok;
+
+  // Pass 4: bounded trim of excess trailing closers
+  for (let i = 0; i < 8 && t.trimEnd().length; i++) {
+    const trimmed = t.trimEnd();
+    const last = trimmed.slice(-1);
+    if (last !== "}" && last !== "]") break;
+    t = trimmed.slice(0, -1);
+    ok = attempt(t);
+    if (ok !== null) return ok;
+  }
+  return null;
+}
+
+/** 🧠 Tool-called memory write: the chat model decided mid-reply that something
+ *  was worth saving, so the gating cost already rode on the reply call. Validates
+ *  + persists exactly like silent extraction; the known set stays empty —
+ *  persistExtraction resolves names against the DB itself (exact → norm → vector).
+ *  Malformed streamed args are repaired (Hermes-style) before parsing. */
+export async function applyRemembered(sourceText: string, argsJson: string) {
+  const repaired = repairToolArguments(argsJson);
+  if (repaired === null) {
+    console.error("🧠 remember: unrepairable tool arguments:", argsJson.slice(0, 500));
+    return { ok: false as const, error: "tool arguments were not valid JSON (repair failed)" };
+  }
+  if (repaired !== (argsJson ?? "").trim()) {
+    console.warn("🧠 remember: tool arguments needed repair");
+  }
+  const raw: unknown = JSON.parse(repaired);
   const parsed = Extraction.safeParse(raw);
   if (!parsed.success) {
     return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
