@@ -169,11 +169,13 @@ export default function GraphView() {
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    fg.d3Force?.("charge")?.strength?.(-300);
-    fg.d3Force?.("link")?.distance?.(95);
-    fg.d3Force?.("center")?.strength?.(0.22); // pull into a 2D constellation, not a flat band
-    fg.d3Force?.("charge")?.distanceMax?.(600); // repulsion bounded — cosmos stays cohesive
-    const collide = forceCollide((n: any) => 24 + (degrees.get(n.id) ?? 0) * 1.6);
+    // Obsidian-like balance: mild center pull forms a round constellation,
+    // bounded repulsion + uniform link length keep nodes clean and separate
+    fg.d3Force?.("charge")?.strength?.(-220);
+    fg.d3Force?.("link")?.distance?.(110);
+    fg.d3Force?.("center")?.strength?.(0.14);
+    fg.d3Force?.("charge")?.distanceMax?.(450);
+    const collide = forceCollide((n: any) => 20 + (degrees.get(n.id) ?? 0) * 1.4);
     collide.strength?.(0.5); // gentle overlap resolution — no violent push-back
     fg.d3Force?.("collide", collide);
   }, [degrees]);
@@ -203,17 +205,12 @@ export default function GraphView() {
         ref={fgRef}
         graphData={data}
         warmupTicks={80}
-        d3AlphaDecay={0.04}
-        d3VelocityDecay={0.35}
+        d3AlphaDecay={0.03}
+        d3VelocityDecay={0.3}
         onEngineStop={() => {
           // pin everything once the layout settles — dragging one neuron
           // no longer shakes unrelated clusters, and the cosmos stays where you left it
-          for (const n of data.nodes) {
-            if (n.x !== undefined) {
-              (n as any).fx = n.x;
-              (n as any).fy = n.y;
-            }
-          }
+          // no pinning — nodes stay under live forces so drags bounce back (Obsidian-style)
         }}
         onNodeDrag={(dragged: any) => {
           if (dragging.current) return;
@@ -236,8 +233,9 @@ export default function GraphView() {
         }}
         onNodeDragEnd={(n: any) => {
           dragging.current = false;
-          n.fx = n.x; // stays exactly where you dropped it
-          n.fy = n.y;
+          delete n.fx; // release → springs back into the disc
+          delete n.fy;
+          fgRef.current?.d3ReheatSimulation?.();
         }}
         backgroundColor={BASE_BG}
         onRenderFramePre={(ctx: CanvasRenderingContext2D) => {
