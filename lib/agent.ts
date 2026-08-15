@@ -25,8 +25,18 @@ import {
 } from "./graph";
 
 // The brain is markdown — code enforces invariants, markdown guides judgment.
-const brain = (file: string) =>
-  fs.readFile(path.join(process.cwd(), "brain", file), "utf8");
+// Cached by mtime: editing a brain file is picked up on the next call, but we no
+// longer read disk on every call (extraction alone read two files per message).
+const brainCache = new Map<string, { mtimeMs: number; content: string }>();
+async function brain(file: string): Promise<string> {
+  const p = path.join(process.cwd(), "brain", file);
+  const { mtimeMs } = await fs.stat(p);
+  const hit = brainCache.get(file);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.content;
+  const content = await fs.readFile(p, "utf8");
+  brainCache.set(file, { mtimeMs, content });
+  return content;
+}
 
 const localToday = () => new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD, local TZ (not UTC!)
 
@@ -71,6 +81,34 @@ const Consolidation = z.object({
   insight: z.string().default(""),
 });
 
+/** JSON-mode chat call: temperature 0 (deterministic — fewer malformed outputs)
+ *  plus one retry with a nudge when parsing still fails. Returns null on failure. */
+async function chatJson(system: string, user: string): Promise<unknown | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await ai().chat.completions.create({
+      model: CHAT_MODEL,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        {
+          role: "user",
+          content:
+            attempt === 0
+              ? user
+              : user + "\n\n(Previous reply was not valid JSON — output ONLY the JSON object.)",
+        },
+      ],
+    });
+    try {
+      return JSON.parse(res.choices[0]?.message?.content ?? "");
+    } catch {
+      // fall through to the retry
+    }
+  }
+  return null;
+}
+
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
 // Retrieval guards: pgvector ALWAYS returns top-N, even when every hit is irrelevant —
@@ -79,6 +117,7 @@ const MIN_RECALL_SCORE = 0.4; // cosine similarity floor for "this memory is act
 const MAX_RECALL_NODES = 8; // cap tokens
 const MAX_RECALL_EDGES = 16; // cap 1-hop neighborhood expansion
 const SALIENCE_WEIGHT = 0.08; // how much use boosts rank: ×(1 + ln(1+mentions)·w) — 30 mentions ≈ +27%
+const MAX_CHAT_HISTORY = 18; // messages sent to the model — digests cover the older stretches
 
 /**
  * Build memory context for a message: thresholded semantic search → salience rerank
@@ -136,30 +175,17 @@ export async function runExtraction(text: string) {
     [...known.values()].map((n) => `- ${n.name} [${n.type}]`).join("\n") ||
     "(empty — this is the first memory)";
 
-  const res = await ai().chat.completions.create({
-    model: CHAT_MODEL,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `${extractMd}\n\n# Current type registry\n${typesMd}\n\n# Existing memory nodes (reuse & link)\n${knownList}\n\n# The user\nThe person speaking IS "${profile.name}" — their profile node exists in the list above. Facts about THEM route there via updates (see "user model" rules).\n\nToday's date: ${localToday()}`,
-      },
-      { role: "user", content: text },
-    ],
-  });
-
-  const raw = res.choices[0]?.message?.content ?? "{}";
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(raw);
-  } catch {
-    return { ok: false as const, error: "model did not return valid JSON", raw };
+  const parsedJson = await chatJson(
+    `${extractMd}\n\n# Current type registry\n${typesMd}\n\n# Existing memory nodes (reuse & link)\n${knownList}\n\n# The user\nThe person speaking IS "${profile.name}" — their profile node exists in the list above. Facts about THEM route there via updates (see "user model" rules).\n\nToday's date: ${localToday()}`,
+    text
+  );
+  if (parsedJson === null) {
+    return { ok: false as const, error: "model did not return valid JSON (after retry)" };
   }
 
   const parsed = Extraction.safeParse(parsedJson);
   if (!parsed.success) {
-    return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues, raw };
+    return { ok: false as const, error: "schema validation failed", issues: parsed.error.issues };
   }
 
   // --- Persist to the memory graph ---
@@ -252,10 +278,12 @@ ${loopsText}
 # Recalled memories
 ${ctx.text}`;
 
+  // Windowed history: digests crystallize older stretches into the graph, so the
+  // model only needs the recent tail — token cost stays bounded as sessions grow.
   const stream = await ai().chat.completions.create({
     model: CHAT_MODEL,
     stream: true,
-    messages: [{ role: "system", content: system }, ...messages],
+    messages: [{ role: "system", content: system }, ...messages.slice(-MAX_CHAT_HISTORY)],
   });
   return { stream, recalled: ctx.ids, recalledNames: ctx.names };
 }
@@ -275,24 +303,11 @@ export async function summarizeConversation(messages: ChatMessage[]) {
     .join("\n")
     .slice(0, 6000);
 
-  const res = await ai().chat.completions.create({
-    model: CHAT_MODEL,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `${digestMd}\n\n# Known memory nodes (for "mentioned")\n${known.map((n) => `- ${n.name}`).join("\n") || "(none)"}\n\nToday's date: ${localToday()}`,
-      },
-      { role: "user", content: transcript },
-    ],
-  });
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(res.choices[0]?.message?.content ?? "{}");
-  } catch {
-    return { ok: false as const, error: "model did not return valid JSON" };
-  }
+  const parsedJson = await chatJson(
+    `${digestMd}\n\n# Known memory nodes (for "mentioned")\n${known.map((n) => `- ${n.name}`).join("\n") || "(none)"}\n\nToday's date: ${localToday()}`,
+    transcript
+  );
+  if (parsedJson === null) return { ok: false as const, error: "model did not return valid JSON (after retry)" };
   const parsed = Digest.safeParse(parsedJson);
   if (!parsed.success) return { ok: false as const, error: "schema validation failed" };
 
@@ -324,36 +339,20 @@ export async function runConsolidation(opts: { apply?: boolean } = {}) {
     recentNegativeFeedback(10),
   ]);
 
-  const res = await ai().chat.completions.create({
-    model: CHAT_MODEL,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `${md}\n\nToday's date: ${localToday()}`,
-      },
-      {
-        role: "user",
-        content: [
-          `# User profile node\n${profile.name} ${JSON.stringify(profile.attrs)}`,
-          `# Duplicate candidates (embedding-similar pairs)\n${
-            dupes.map((d) => `- "${d.a_name}" ≈ "${d.b_name}" (similarity ${d.sim.toFixed(2)})`).join("\n") || "(none)"
-          }`,
-          `# Recent 👎 feedback on replies\n${
-            thumbsDown.map((f) => `- user: "${f.user_msg.slice(0, 140)}" → reply: "${f.assistant_msg.slice(0, 200)}"`).join("\n") || "(none)"
-          }`,
-          `# Live memory nodes\n${recent.map((n) => `- ${n.name} [${n.type}]`).join("\n") || "(none)"}`,
-        ].join("\n\n"),
-      },
-    ],
-  });
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(res.choices[0]?.message?.content ?? "{}");
-  } catch {
-    return { ok: false as const, error: "model did not return valid JSON" };
-  }
+  const parsedJson = await chatJson(
+    `${md}\n\nToday's date: ${localToday()}`,
+    [
+      `# User profile node\n${profile.name} ${JSON.stringify(profile.attrs)}`,
+      `# Duplicate candidates (embedding-similar pairs)\n${
+        dupes.map((d) => `- "${d.a_name}" ≈ "${d.b_name}" (similarity ${d.sim.toFixed(2)})`).join("\n") || "(none)"
+      }`,
+      `# Recent 👎 feedback on replies\n${
+        thumbsDown.map((f) => `- user: "${f.user_msg.slice(0, 140)}" → reply: "${f.assistant_msg.slice(0, 200)}"`).join("\n") || "(none)"
+      }`,
+      `# Live memory nodes\n${recent.map((n) => `- ${n.name} [${n.type}]`).join("\n") || "(none)"}`,
+    ].join("\n\n")
+  );
+  if (parsedJson === null) return { ok: false as const, error: "model did not return valid JSON (after retry)" };
   const parsed = Consolidation.safeParse(parsedJson);
   if (!parsed.success) return { ok: false as const, error: "schema validation failed" };
 
