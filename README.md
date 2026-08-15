@@ -21,7 +21,7 @@ Five feedback loops make every chat improve the next:
 1. **Profile** — a pinned node for you (the ☀️ of the cosmos, always in context); preferences, habits and style feedback accrue as dot-key attrs and silently shape every reply
 2. **Salience** — memories strengthen when used (mention/recall counts), sink when neglected; recall reranks cosine × salience
 3. **Consolidation** — the sleep cycle: `POST /api/admin/consolidate` (dry run) promotes patterns into your profile; `{"apply": true}` also merges duplicates; stale candidates reported
-4. **Continuity** — conversations crystallize into `Conversation` digest nodes (auto every 6 messages + on clear-chat); open loops (unfinished tasks) get natural callbacks
+4. **Continuity** — chat history persists server-side (survives refresh; the client sends only the new message); conversations crystallize into `Conversation` digest nodes (auto every 6 exchanges — 12 persisted messages, counted from the DB — + on clear-chat); open loops (unfinished tasks) get natural callbacks
 5. **Feedback** — 👍/👎 on replies feeds consolidation; the ✨ Week button shows what it learned
 
 ## The loop
@@ -30,13 +30,15 @@ Five feedback loops make every chat improve the next:
 3. `POST /api/ask` → cited answers from the graph
 
 ## Routes
-- `/api/chat` · `/api/dump` · `/api/ask` · `/api/graph` · `/api/recap` · `/api/feedback`
-- `/api/conversations/digest` — session-end crystallization
-- `/api/admin/rebuild` (re-extract all dumps) · `/api/admin/consolidate` (sleep cycle)
+- `/api/chat` · `/api/chat/history` (session rehydration) · `/api/dump` · `/api/ask` · `/api/graph` · `/api/recap` · `/api/feedback`
+- `/api/graph/node` — node inspector payload (GET) + explicit forget (POST `{id, action:"forget"}`)
+- `/api/conversations/digest` — session-end crystallization (server-side transcript) + session rotation
+- `/api/admin/rebuild` (re-extract all dumps) · `/api/admin/consolidate` (sleep cycle: nightly cron = dry-run proposals; `POST {"apply": true}` applies merges) · `/api/admin/export` (full JSON backup)
 
 ## Migrations
 Schema lives in `db/migrations/`, auto-applied on `npm run dev` (tracked in a `_migrations` table).
 To change the schema: add `00X_your_change.sql` → runs on next dev start. Never edit applied files.
+Note: `npm run build` no longer migrates (DDL against prod mid-build was risky) — run `npm run db:migrate` before deploying schema changes.
 
 ## Smoke test
 With the dev server up: `node scripts/test-growth.mjs` — verifies profile seeding, attr accrual and recall end-to-end.

@@ -7,7 +7,9 @@ export const maxDuration = 120;
  * /api/admin/consolidate — the sleep cycle.
  * POST (manual): default dry run — promotes profile attrs, returns merge
  *   proposals + stale candidates. Body { "apply": true }: also applies merges.
- * GET (Vercel Cron, nightly): applies merges — safe, history preserved.
+ * GET (Vercel Cron, nightly): DRY RUN only — proposes merges + reports stale
+ *   candidates without touching the graph. Merges are applied explicitly via
+ *   POST {"apply": true}, so a bad auto-merge can never mangle history.
  *
  * Auth: when CRON_SECRET is set (production), callers must send
  * `Authorization: Bearer <CRON_SECRET>` — Vercel Cron does this automatically.
@@ -27,5 +29,5 @@ export async function POST(req: Request) {
 
 export async function GET(req: Request) {
   if (!authorized(req)) return Response.json({ error: "unauthorized" }, { status: 401 });
-  return Response.json(await runConsolidation({ apply: true }));
+  return Response.json(await runConsolidation({ apply: false }));
 }
