@@ -523,7 +523,9 @@ export async function applyRemembered(sourceText: string, argsJson: string) {
  *  no tools this time, so the loop can't recurse. */
 export async function continueChat(
   requestMessages: ChatCompletionMessageParam[],
-  toolCalls: { id: string; name: string; arguments: string }[]
+  toolCalls: { id: string; name: string; arguments: string }[],
+  results: string[],
+  allowRememberRetry = false
 ) {
   const calls = toolCalls.map((tc, i) => ({
     id: tc.id || `call_${i}`,
@@ -533,14 +535,19 @@ export async function continueChat(
   return ai().chat.completions.create({
     model: CHAT_MODEL,
     stream: true,
+    // One-shot retry: re-attach the remember tool only when a save failed.
+    // The route never runs a phase 3, so the loop cannot recurse.
+    ...(allowRememberRetry
+      ? { tools: [REMEMBER_TOOL], tool_choice: "auto" as const }
+      : {}),
     messages: [
       ...requestMessages,
       { role: "assistant", content: null, tool_calls: calls },
       ...calls.map(
-        (c): ChatCompletionMessageParam => ({
+        (c, i): ChatCompletionMessageParam => ({
           role: "tool",
           tool_call_id: c.id,
-          content: "✓ Saved to long-term memory.",
+          content: results[i] ?? "✓ Saved to long-term memory.",
         })
       ),
     ],
