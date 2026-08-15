@@ -61,8 +61,10 @@ type GNode = {
   created?: string; // created_at ISO — feeds the timelapse slider range
   x?: number;
   y?: number;
-  vx?: number; // velocity — d3-force integrates these (pop-out kicks)
+  vx?: number; // velocity — d3-force integrates these
   vy?: number;
+  fx?: number; // fixed position pin (used during the pop-out tween; delete to release)
+  fy?: number;
 };
 type GLink = { source: string | GNode; target: string | GNode; type: string };
 type GData = { nodes: GNode[]; links: GLink[] };
@@ -88,6 +90,7 @@ export default function GraphView() {
   const dirtyUntil = useRef(0);
   const pulses = useRef<Map<string, number>>(new Map());
   const births = useRef<Map<string, number>>(new Map()); // node id → first-seen ts (bloom-in)
+  const pops = useRef(new Map<string, { ax: number; ay: number; ang: number; t0: number }>()); // pop-out tweens
 
   // ── 🕰️ timelapse — serial-based, not time-based ──────────────────────
   // The cosmos replays in the order neurons were born (the snapshot arrives
@@ -218,18 +221,18 @@ export default function GraphView() {
           ? nodes.find((m) => m.id === (idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source)))
           : undefined;
         if (anchor?.x !== undefined) {
-          // 🎆 pop out FROM the parent (Obsidian timelapse feel): spawn at its
-          // exact position with an outward velocity kick — physics springs the
-          // new neuron away from the node it belongs to, then links settle it
+          // 🎆 pop out FROM the parent (Obsidian timelapse feel): spawn pinned at
+          // its exact position, then a per-frame tween eases it outward (d3's
+          // velocity decay eats plain kicks in ~5 ticks — too fast to read as motion)
           n.x = anchor.x;
           n.y = anchor.y ?? 0;
-          const ang = Math.random() * Math.PI * 2;
-          n.vx = Math.cos(ang) * 9;
-          n.vy = Math.sin(ang) * 9;
+          n.fx = n.x;
+          n.fy = n.y;
+          pops.current.set(n.id, { ax: n.x, ay: n.y, ang: Math.random() * Math.PI * 2, t0: now });
           kicked = true;
         }
       }
-      // wake the sim so the velocity kicks actually play out
+      // wake the sim so nodes settle naturally once the tween releases them
       if (kicked) queueMicrotask(() => fgRef.current?.d3ReheatSimulation?.());
     }
     prevVisible.current = visible;
@@ -290,7 +293,7 @@ export default function GraphView() {
               const now = performance.now();
               births.current.set(n.id, now);
               pulses.current.set(n.id, now);
-              // pop out FROM the neighbor it belongs to (exact position + kick)
+              // pop out FROM the neighbor it belongs to (pinned + outward tween)
               const nb = d.links.find((l) => idOf(l.source) === n.id || idOf(l.target) === n.id);
               const anchor = nb
                 ? old.get(idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source))
@@ -298,9 +301,14 @@ export default function GraphView() {
               if (anchor && anchor.x !== undefined) {
                 n.x = anchor.x;
                 n.y = anchor.y ?? 0;
-                const ang = Math.random() * Math.PI * 2;
-                n.vx = Math.cos(ang) * 9;
-                n.vy = Math.sin(ang) * 9;
+                n.fx = n.x;
+                n.fy = n.y;
+                pops.current.set(n.id, {
+                  ax: n.x,
+                  ay: n.y,
+                  ang: Math.random() * Math.PI * 2,
+                  t0: performance.now(),
+                });
               }
             }
             return n;
@@ -397,6 +405,22 @@ export default function GraphView() {
           const n = node as GNode & { x: number; y: number };
           // position not assigned yet (fresh timelapse slice entry) — skip this frame
           if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return;
+
+          // 🎆 pop-out tween: pinned node eases ~90px outward from its parent
+          // with a slight overshoot (easeOutBack), then releases to physics
+          const pop = pops.current.get(n.id);
+          if (pop) {
+            const p = Math.min(1, (performance.now() - pop.t0) / 700);
+            const e = 1 + 2.70158 * Math.pow(p - 1, 3) + 1.70158 * Math.pow(p - 1, 2);
+            const dist = 90 * e;
+            n.x = n.fx = pop.ax + Math.cos(pop.ang) * dist;
+            n.y = n.fy = pop.ay + Math.sin(pop.ang) * dist;
+            if (p >= 1) {
+              delete n.fx; // release → force layout takes over
+              delete n.fy;
+              pops.current.delete(n.id);
+            }
+          }
           const isSun = !!n.pinned;
           const color = isSun ? SUN : colorFor(n.type);
           const r = radiusOf(n);
