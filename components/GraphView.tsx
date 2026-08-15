@@ -78,6 +78,36 @@ export default function GraphView() {
     travelTimer.current = setTimeout(() => load(), 180);
   };
 
+  // ── ▶ timelapse (Obsidian-style): auto-play the graph's growth ─────────
+  const [playing, setPlaying] = useState(false);
+  const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPlay = () => {
+    if (playRef.current) clearInterval(playRef.current);
+    playRef.current = null;
+    setPlaying(false);
+  };
+
+  const play = () => {
+    if (playing) return stopPlay();
+    if (!firstDayEver.current) return;
+    const start = dayToInt(firstDayEver.current);
+    const end = dayToInt(today);
+    const step = Math.max(1, Math.ceil((end - start) / 60)); // ≤ ~60 frames total
+    let cur = start;
+    setPlaying(true);
+    travel(intToDay(cur));
+    playRef.current = setInterval(() => {
+      cur += step;
+      if (cur >= end) {
+        stopPlay();
+        travel(null); // land back on the live graph
+        return;
+      }
+      travel(intToDay(cur));
+    }, 650);
+  };
+
   // ── node inspector ─────────────────────────────────────────────────────
   type NodeDetail = {
     node: GNode & {
@@ -218,6 +248,7 @@ export default function GraphView() {
       window.removeEventListener("sanctum:dirty", onDirty);
       window.removeEventListener("sanctum:recalled", onRecalled);
       clearInterval(t);
+      if (playRef.current) clearInterval(playRef.current);
     };
   }, []);
 
@@ -331,6 +362,17 @@ export default function GraphView() {
       {/* 🕰️ time-travel — scrub the cosmos back through its history */}
       {firstDayEver.current && firstDayEver.current < today && (
         <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur">
+          <button
+            onClick={play}
+            title={playing ? "Stop timelapse" : "▶ Timelapse — watch your brain grow"}
+            className={`grid h-5 w-5 place-items-center rounded-full border text-[9px] transition active:scale-90 ${
+              playing
+                ? "border-amber-300/50 bg-amber-400/15 text-amber-300"
+                : "border-white/15 text-slate-400 hover:border-indigo-300/50 hover:text-indigo-300"
+            }`}
+          >
+            {playing ? "⏸" : "▶"}
+          </button>
           <span className="text-[11px]" title="Time-travel: the graph as it was">
             🕰️
           </span>
@@ -342,6 +384,7 @@ export default function GraphView() {
             max={dayToInt(today)}
             value={dayToInt(asOf ?? today)}
             onChange={(e) => {
+              stopPlay(); // manual scrub wins over playback
               const d = intToDay(Number(e.target.value));
               travel(d === today ? null : d);
             }}
