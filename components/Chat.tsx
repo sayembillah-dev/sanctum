@@ -10,6 +10,8 @@ type Recap = {
   newest: { name: string; type: string }[];
   topMentioned: { name: string; type: string; mention_count: number }[];
   feedback: { up: number; down: number };
+  openLoops: { name: string; due: string | null; overdue: boolean }[];
+  latestDigest: { name: string; summary: string; date: string } | null;
 };
 
 export default function Chat() {
@@ -21,10 +23,25 @@ export default function Chat() {
   const [recap, setRecap] = useState<Recap | "loading" | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Conversation persistence: rehydrate the current session's thread on load —
+  // a refresh no longer wipes the chat.
+  const hydrated = useRef(false);
+  useEffect(() => {
+    if (hydrated.current) return;
+    hydrated.current = true;
+    fetch("/api/chat/history", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (Array.isArray(d.messages) && d.messages.length) setMessages(d.messages);
+      })
+      .catch(() => {});
+  }, []);
 
   // auto-growing composer
   useEffect(() => {
@@ -51,16 +68,11 @@ export default function Chat() {
 
   function clearChat() {
     if (!confirmClear) return setConfirmClear(true);
-    // 🌙 session ended — crystallize it into a memory digest node (fire-and-forget)
-    if (messages.length >= 4) {
-      fetch("/api/conversations/digest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages }),
-      })
-        .then(() => window.dispatchEvent(new Event("sanctum:dirty")))
-        .catch(() => {});
-    }
+    // 🌙 session ended — the server crystallizes its transcript into a digest
+    // node and rotates to a fresh session (fire-and-forget)
+    fetch("/api/conversations/digest", { method: "POST" })
+      .then(() => window.dispatchEvent(new Event("sanctum:dirty")))
+      .catch(() => {});
     setMessages([]);
     setFb({});
     setError(null);
@@ -76,11 +88,15 @@ export default function Chat() {
     // memory write starts server-side now → wake the graph view
     window.dispatchEvent(new Event("sanctum:dirty"));
     setBusy(true);
+    const abort = new AbortController();
+    abortRef.current = abort;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history }),
+        // The server holds the thread in the DB — send only the new message.
+        body: JSON.stringify({ message: text }),
+        signal: abort.signal,
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
       const recalled = res.headers.get("X-Recalled-Nodes");
@@ -98,13 +114,22 @@ export default function Chat() {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: snapshot }]);
       }
     } catch {
-      setError("Connection hiccup — that message didn't land. Try again.");
-      setMessages(history);
+      if (abort.signal.aborted) {
+        // user hit stop — keep whatever reply streamed in
+      } else {
+        setError("Connection hiccup — that message didn't land. Try again.");
+        setMessages(history);
+      }
     } finally {
+      abortRef.current = null;
       setBusy(false);
       // extraction may still be landing after the stream ends — keep the graph watching
       window.dispatchEvent(new Event("sanctum:dirty"));
     }
+  }
+
+  function stop() {
+    abortRef.current?.abort(); // the partial reply stays on screen
   }
 
   // 👍/👎 — teaches Sanctum what good looks like (read by the consolidation cycle)
@@ -224,6 +249,34 @@ export default function Chat() {
                       </ul>
                     </>
                   )}
+                  {(recap.openLoops?.length ?? 0) > 0 && (
+                    <>
+                      <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                        Open loops
+                      </p>
+                      <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
+                        {recap.openLoops.map((l) => (
+                          <li key={l.name} className="truncate">
+                            {l.name}{" "}
+                            <span className={l.overdue ? "text-rose-400" : "text-slate-600"}>
+                              {l.due ? (l.overdue ? `overdue ${l.due}` : `due ${l.due}`) : "no deadline"}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  {recap.latestDigest && (
+                    <>
+                      <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                        Last session
+                      </p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                        {recap.latestDigest.summary.slice(0, 220)}
+                        <span className="text-slate-600"> · {recap.latestDigest.date}</span>
+                      </p>
+                    </>
+                  )}
                   <p className="mt-4 text-center text-[10px] text-slate-600">tap outside to close</p>
                 </>
               )}
@@ -323,26 +376,39 @@ export default function Chat() {
             disabled={busy}
             className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500 disabled:opacity-50"
           />
-          <button
-            onClick={send}
-            disabled={busy || !input.trim()}
-            aria-label="Send"
-            className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow-lg shadow-indigo-500/30 transition hover:brightness-110 active:scale-95 disabled:opacity-30 disabled:shadow-none"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {busy ? (
+            <button
+              onClick={stop}
+              aria-label="Stop generating"
+              title="Stop — keeps what streamed so far"
+              className="grid h-9 w-9 flex-none place-items-center rounded-xl border border-rose-400/40 bg-rose-500/15 text-rose-300 transition hover:bg-rose-500/25 active:scale-95"
             >
-              <path d="M12 19V5" />
-              <path d="m5 12 7-7 7 7" />
-            </svg>
-          </button>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="5" y="5" width="14" height="14" rx="2" />
+              </svg>
+            </button>
+          ) : (
+            <button
+              onClick={send}
+              disabled={!input.trim()}
+              aria-label="Send"
+              className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow-lg shadow-indigo-500/30 transition hover:brightness-110 active:scale-95 disabled:opacity-30 disabled:shadow-none"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 19V5" />
+                <path d="m5 12 7-7 7 7" />
+              </svg>
+            </button>
+          )}
         </div>
         <p className="mt-2 text-center text-[10px] tracking-wide text-slate-600">
           Enter to send · Shift + Enter for a new line

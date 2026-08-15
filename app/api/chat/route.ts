@@ -5,15 +5,37 @@ import {
   summarizeConversation,
   extractFromStretch,
 } from "@/lib/agent";
-import { markRecallUsed } from "@/lib/graph";
+import {
+  markRecallUsed,
+  currentSessionId,
+  appendChatMessage,
+  recentChatMessages,
+  sessionMessageCount,
+} from "@/lib/graph";
+
+// Digest cadence: every 12 persisted messages (= 6 user⇄assistant exchanges).
+// Sourced from the DB now — client retries or clear-chat can't shift or
+// double-fire it, and the digest stretch comes from the server-side transcript.
+const DIGEST_EVERY = 12;
 
 export async function POST(req: Request) {
-  const { messages } = await req.json();
-  if (!Array.isArray(messages) || !messages.length) {
-    return Response.json({ error: "messages required" }, { status: 400 });
+  let body: { message?: unknown };
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+  const message = typeof body.message === "string" ? body.message.trim() : "";
+  if (!message) {
+    return Response.json({ error: "message required" }, { status: 400 });
   }
 
-  const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  // Server-side conversation state: persist the user turn, then build context
+  // from the DB — the client no longer ships the whole thread with each request.
+  const sessionId = await currentSessionId();
+  await appendChatMessage(sessionId, "user", message);
+  const messages = await recentChatMessages(sessionId, 40);
+
   const { stream, recalled, recalledNames, requestMessages } = await chat(messages);
   const encoder = new TextEncoder();
   let reply = "";
@@ -59,7 +81,7 @@ export async function POST(req: Request) {
                 continue;
               }
               try {
-                const r = await applyRemembered(lastUser, c.arguments);
+                const r = await applyRemembered(message, c.arguments);
                 console.log("🧠 remember:", JSON.stringify(r));
                 results.push(
                   r.ok
@@ -104,7 +126,7 @@ export async function POST(req: Request) {
                 .map((i) => retryCalls[i])
                 .filter((c) => c.name === "remember");
               for (const c of retries) {
-                applyRemembered(lastUser, c.arguments)
+                applyRemembered(message, c.arguments)
                   .then((r) => console.log("🧠 remember (retry):", JSON.stringify(r)))
                   .catch((e) => console.error("🧠 remember (retry) failed:", e));
               }
@@ -113,13 +135,25 @@ export async function POST(req: Request) {
             // Fast path: the reply already streamed — fire-and-forget, the
             // reply NEVER waits for the write.
             for (const c of calls.filter((c) => c.name === "remember")) {
-              applyRemembered(lastUser, c.arguments)
+              applyRemembered(message, c.arguments)
                 .then((r) => console.log("🧠 remember:", JSON.stringify(r)))
                 .catch((e) => console.error("🧠 remember failed:", e));
             }
           }
+        } catch (e) {
+          // A mid-stream failure used to surface as a silently truncated reply.
+          // Keep whatever streamed, tell the user it broke, persist the partial.
+          console.error("chat stream failed:", e);
+          try {
+            controller.enqueue(encoder.encode("\n\n⚠️ (connection dropped mid-reply — try sending again)"));
+          } catch {
+            /* stream already closed */
+          }
         } finally {
           controller.close();
+          // Persist the assistant turn (even a partial one) — history, cadence
+          // and digests all read from the DB transcript now.
+          await appendChatMessage(sessionId, "assistant", reply).catch(() => {});
           // 🌱 Growth bookkeeping — fire-and-forget, never delays the reply:
           // recalled nodes the reply actually cited get their usage count bumped
           const used = recalled.filter((id) => {
@@ -127,18 +161,21 @@ export async function POST(req: Request) {
             return name && reply.toLowerCase().includes(name.toLowerCase());
           });
           if (used.length) markRecallUsed(used).catch(() => {});
-          // every 12 messages: crystallize the recent stretch into a digest node,
-          // and run the safety-net extraction over it — catches lasting facts the
-          // in-reply remember tool didn't fire on (amortized ~12× cheaper than
-          // the old per-message silent extraction).
-          if (messages.length >= 12 && messages.length % 12 === 0) {
-            const stretch = messages.slice(-16);
-            summarizeConversation(stretch)
-              .then((r) => console.log("🌙 digest:", JSON.stringify(r)))
-              .catch((e) => console.error("🌙 digest failed:", e));
-            extractFromStretch(stretch)
-              .then((r) => console.log("🌙 digest-extract:", JSON.stringify(r)))
-              .catch((e) => console.error("🌙 digest-extract failed:", e));
+          // Every 12 persisted messages: crystallize the recent stretch into a
+          // digest node + safety-net extraction over it (catches lasting facts
+          // the in-reply remember tool didn't fire on).
+          const count = await sessionMessageCount(sessionId).catch(() => 0);
+          if (count >= DIGEST_EVERY && count % DIGEST_EVERY === 0) {
+            recentChatMessages(sessionId, 16)
+              .then((stretch) => {
+                summarizeConversation(stretch)
+                  .then((r) => console.log("🌙 digest:", JSON.stringify(r)))
+                  .catch((e) => console.error("🌙 digest failed:", e));
+                extractFromStretch(stretch)
+                  .then((r) => console.log("🌙 digest-extract:", JSON.stringify(r)))
+                  .catch((e) => console.error("🌙 digest-extract failed:", e));
+              })
+              .catch(() => {});
           }
         }
       },
