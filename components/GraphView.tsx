@@ -85,6 +85,7 @@ export default function GraphView() {
   const prevCount = useRef(0);
   const dirtyUntil = useRef(0);
   const pulses = useRef<Map<string, number>>(new Map());
+  const births = useRef<Map<string, number>>(new Map()); // node id → first-seen ts (bloom-in)
 
   // ── 🕰️ time-travel ───────────────────────────────────────────────────
   // asOf = null → live graph; a date → the cosmos as it was that day.
@@ -258,7 +259,24 @@ export default function GraphView() {
           // out of the cosmos live (no ghost neurons lingering until refresh).
           nodes: d.nodes.map((n) => {
             const o = old.get(n.id);
-            return o ? Object.assign(o, n) : n; // keep positions across refreshes
+            if (o) return Object.assign(o, n); // keep positions across refreshes
+            // New neuron entering the cosmos → bloom-in + welcome flash.
+            // Skipped on first load (everything would bloom at once).
+            if (prev.nodes.length > 0) {
+              const now = performance.now();
+              births.current.set(n.id, now);
+              pulses.current.set(n.id, now);
+              // spawn beside a neighbor so the bloom lands in context, not at origin
+              const nb = d.links.find((l) => idOf(l.source) === n.id || idOf(l.target) === n.id);
+              const anchor = nb
+                ? old.get(idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source))
+                : undefined;
+              if (anchor) {
+                n.x = (anchor.x ?? 0) + (Math.random() - 0.5) * 40;
+                n.y = (anchor.y ?? 0) + (Math.random() - 0.5) * 40;
+              }
+            }
+            return n;
           }),
           // defensive: never keep a link whose endpoint left the graph
           links: d.links.filter((l) => alive.has(idOf(l.source)) && alive.has(idOf(l.target))),
@@ -364,10 +382,16 @@ export default function GraphView() {
           const boost = raw * raw;
           if (t0 !== undefined && raw <= 0) pulses.current.delete(n.id);
 
+          // bloom-in (timelapse / freshly extracted neurons): easeOutCubic over ~0.9s
+          const tB = births.current.get(n.id);
+          const birthF = tB === undefined ? 1 : Math.min(1, (performance.now() - tB) / 900);
+          if (birthF >= 1 && tB !== undefined) births.current.delete(n.id);
+          const eB = 1 - Math.pow(1 - birthF, 3);
+
           // halo — radial gradient, fades to nothing (no hard edge)
-          const haloR = r * (2.1 + 1.2 * boost);
+          const haloR = r * (2.1 + 1.2 * boost) * eB;
           const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
-          g.addColorStop(0, `rgba(${cr},${cg},${cb},${mix(boost > 0 ? 0.19 : 0.1, 0.028, dimF).toFixed(3)})`);
+          g.addColorStop(0, `rgba(${cr},${cg},${cb},${(mix(boost > 0 ? 0.19 : 0.1, 0.028, dimF) * eB).toFixed(3)})`);
           g.addColorStop(1, color + "00");
           ctx.fillStyle = g;
           ctx.beginPath();
@@ -376,8 +400,8 @@ export default function GraphView() {
 
           // core
           ctx.beginPath();
-          ctx.arc(n.x, n.y, r * (1 + 0.25 * boost), 0, Math.PI * 2);
-          ctx.fillStyle = `rgba(${cr},${cg},${cb},${mix(1, 0.14, dimF).toFixed(3)})`;
+          ctx.arc(n.x, n.y, r * (1 + 0.25 * boost) * eB, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${cr},${cg},${cb},${(mix(1, 0.14, dimF) * eB).toFixed(3)})`;
           ctx.fill();
 
           // label — constant screen size, hidden when far zoomed out
@@ -386,7 +410,7 @@ export default function GraphView() {
             ctx.font = `${isSun ? 700 : 500} ${fs}px Inter, system-ui, sans-serif`;
             ctx.textAlign = "center";
             ctx.textBaseline = "top";
-            ctx.fillStyle = `rgba(226,232,255,${mix(0.82, 0.08, dimF).toFixed(3)})`;
+            ctx.fillStyle = `rgba(226,232,255,${(mix(0.82, 0.08, dimF) * eB).toFixed(3)})`;
             ctx.fillText(n.name, n.x, n.y + r + fs * 0.55);
           }
         }}
