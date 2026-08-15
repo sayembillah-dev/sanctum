@@ -1,6 +1,8 @@
 # Sanctum
 
 An agentic second brain that grows with you. Dump anything and an extraction agent builds a linked memory graph automatically, then chat with an assistant that knows you better after every conversation.
+<img width="1900" height="921" alt="sanctum" src="https://github.com/user-attachments/assets/fd2acc92-b688-44ca-861b-c62c3911ff6c" />
+
 
 ## Contents
 
