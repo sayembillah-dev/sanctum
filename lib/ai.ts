@@ -1,6 +1,6 @@
-import OpenAI from "openai";
+﻿import OpenAI from "openai";
 
-// Azure Foundry — OpenAI-compatible. One endpoint, one key: chat + embeddings.
+// Azure Foundry, OpenAI-compatible. One endpoint, one key: chat + embeddings.
 // Lazy: instantiated on first call, not at import time (keeps `next build` happy without env vars).
 let client: OpenAI | null = null;
 
@@ -14,9 +14,11 @@ export function ai(): OpenAI {
   return client;
 }
 
-export const CHAT_MODEL = "FW-Kimi-K3";
-export const EMBED_MODEL = "text-embedding-3-large";
-export const EMBED_DIMS = 1536; // pgvector HNSW caps at 2000 dims — always request 1536
+// Model deployments come from env so they can be swapped without a code change.
+// Defaults below match the current Azure Foundry deployments.
+export const CHAT_MODEL = process.env.AZURE_FOUNDRY_CHAT_MODEL ?? "FW-Kimi-K3";
+export const EMBED_MODEL = process.env.AZURE_FOUNDRY_EMBED_MODEL ?? "text-embedding-3-large";
+export const EMBED_DIMS = 1536; // pgvector HNSW caps at 2000 dims, so always request 1536
 
 // ── R4: resilient AI calls (ported intent from Hermes error_classifier.py) ───
 // A bare 429 used to kill the user-facing stream. Now: transient failures
@@ -63,7 +65,7 @@ export async function withRetry<T>(
       console.warn(
         `⚡ ${label}: attempt ${i + 1}/${attempts} failed${
           status ? ` (HTTP ${status})` : " (connection)"
-        } — retrying in ${Math.round(wait)}ms${ra !== null ? " (Retry-After)" : ""}`
+        } - retrying in ${Math.round(wait)}ms${ra !== null ? " (Retry-After)" : ""}`
       );
       await sleep(wait);
     }
@@ -71,7 +73,7 @@ export async function withRetry<T>(
 }
 
 /** The ONE canonical text shape a node is embedded as. Anything querying nodes by
- *  similarity must stay in this shape family — findNode used to embed
+ *  similarity must stay in this shape family - findNode used to embed
  *  "entity: {name}" against "{type}: {name} {attrs}" vectors, degrading the math. */
 export const embedNodeText = (type: string, name: string, attrs: unknown): string =>
   `${type}: ${name} ${JSON.stringify(attrs ?? {})}`;
@@ -113,7 +115,7 @@ export async function embed(text: string): Promise<number[]> {
 }
 
 /** Batch embedding: ONE HTTP call for N texts (the embeddings API accepts arrays).
- *  Cache-aware and order-preserving — extraction embeds all new nodes in a single
+ *  Cache-aware and order-preserving - extraction embeds all new nodes in a single
  *  round trip instead of one call per node. */
 export async function embedBatch(texts: string[]): Promise<number[][]> {
   if (!texts.length) return [];
