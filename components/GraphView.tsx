@@ -380,6 +380,8 @@ export default function GraphView() {
         // ── nodes: clean dot + gradient-faded halo + label ──
         nodeCanvasObject={(node: any, ctx: CanvasRenderingContext2D, scale: number) => {
           const n = node as GNode & { x: number; y: number };
+          // position not assigned yet (fresh timelapse slice entry) — skip this frame
+          if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return;
           const isSun = !!n.pinned;
           const color = isSun ? SUN : colorFor(n.type);
           const r = radiusOf(n);
@@ -428,6 +430,7 @@ export default function GraphView() {
         }}
         nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
           const n = node as GNode & { x: number; y: number };
+          if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return; // unpositioned yet
           ctx.fillStyle = color;
           ctx.beginPath();
           ctx.arc(n.x, n.y, radiusOf(n) + 6, 0, Math.PI * 2);
