@@ -61,6 +61,8 @@ type GNode = {
   created?: string; // created_at ISO — feeds the timelapse slider range
   x?: number;
   y?: number;
+  vx?: number; // velocity — d3-force integrates these (pop-out kicks)
+  vy?: number;
 };
 type GLink = { source: string | GNode; target: string | GNode; type: string };
 type GData = { nodes: GNode[]; links: GLink[] };
@@ -202,6 +204,7 @@ export default function GraphView() {
     const visible = new Set(nodes.map((n) => n.id));
     if (prevVisible.current.size > 0) {
       const now = performance.now();
+      let kicked = false;
       for (const n of nodes) {
         if (prevVisible.current.has(n.id) || n.x !== undefined) continue;
         births.current.set(n.id, now);
@@ -215,10 +218,19 @@ export default function GraphView() {
           ? nodes.find((m) => m.id === (idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source)))
           : undefined;
         if (anchor?.x !== undefined) {
-          n.x = anchor.x + (Math.random() - 0.5) * 40;
-          n.y = (anchor.y ?? 0) + (Math.random() - 0.5) * 40;
+          // 🎆 pop out FROM the parent (Obsidian timelapse feel): spawn at its
+          // exact position with an outward velocity kick — physics springs the
+          // new neuron away from the node it belongs to, then links settle it
+          n.x = anchor.x;
+          n.y = anchor.y ?? 0;
+          const ang = Math.random() * Math.PI * 2;
+          n.vx = Math.cos(ang) * 9;
+          n.vy = Math.sin(ang) * 9;
+          kicked = true;
         }
       }
+      // wake the sim so the velocity kicks actually play out
+      if (kicked) queueMicrotask(() => fgRef.current?.d3ReheatSimulation?.());
     }
     prevVisible.current = visible;
     return {
@@ -278,14 +290,17 @@ export default function GraphView() {
               const now = performance.now();
               births.current.set(n.id, now);
               pulses.current.set(n.id, now);
-              // spawn beside a neighbor so the bloom lands in context, not at origin
+              // pop out FROM the neighbor it belongs to (exact position + kick)
               const nb = d.links.find((l) => idOf(l.source) === n.id || idOf(l.target) === n.id);
               const anchor = nb
                 ? old.get(idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source))
                 : undefined;
-              if (anchor) {
-                n.x = (anchor.x ?? 0) + (Math.random() - 0.5) * 40;
-                n.y = (anchor.y ?? 0) + (Math.random() - 0.5) * 40;
+              if (anchor && anchor.x !== undefined) {
+                n.x = anchor.x;
+                n.y = anchor.y ?? 0;
+                const ang = Math.random() * Math.PI * 2;
+                n.vx = Math.cos(ang) * 9;
+                n.vy = Math.sin(ang) * 9;
               }
             }
             return n;
