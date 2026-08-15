@@ -58,6 +58,24 @@ export function slug(name: string): string {
   return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(s) ? `~${s}` : s; // Windows reserved names
 }
 
+let enabledCache: { v: boolean; at: number } | null = null;
+
+/** Opt-in write-through switch (app_state key "mirror_enabled"); default OFF.
+ *  Cached 5s so a stretch inserting many dumps doesn't re-read the row each
+ *  time. buildVault/zipVault are NOT gated -- an explicit export always works. */
+async function mirrorEnabled(): Promise<boolean> {
+  if (enabledCache && Date.now() - enabledCache.at < 5000) return enabledCache.v;
+  let v = false;
+  try {
+    const row = await prisma.appState.findUnique({ where: { key: "mirror_enabled" } });
+    v = row?.value === true;
+  } catch {
+    v = false; // DB hiccup = off; the dump itself is never affected
+  }
+  enabledCache = { v, at: Date.now() };
+  return v;
+}
+
 /**
  * Append one dump to its day file. Idempotent — the dump-id marker is checked
  * before writing, so re-extractions and retries never double up. Callers
@@ -65,6 +83,7 @@ export function slug(name: string): string {
  */
 export async function mirrorDump(d: { id: string; raw_text: string; created_at: Date | string }) {
   return enqueue(async () => {
+    if (!(await mirrorEnabled())) return; // opt-in: off unless the user turns it on
     const file = path.join(/*turbopackIgnore: true*/ MIRROR_ROOT, "dumps", `${dayOf(new Date(d.created_at))}.md`);
     const marker = `<!-- sanctum:dump:${d.id} -->`;
     const existing = await fs.readFile(/*turbopackIgnore: true*/ file, "utf8").catch(() => null);

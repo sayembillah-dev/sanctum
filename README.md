@@ -89,7 +89,7 @@ flowchart TD
 
 Postgres is a rebuildable index; your dumps are the source of truth — and the truth also lives as plain text on disk, not only in the database. `lib/mirror.ts` maintains an Obsidian-ready vault at `./mirror` (override with `SANCTUM_MIRROR_DIR`; gitignored):
 
-- **Write-through**: every dump is appended to `mirror/dumps/YYYY-MM-DD.md` (local-time day files) the moment it persists. Idempotent (a dump-id marker prevents doubles), fire-and-forget, never blocks a memory write.
+- **Write-through** (opt-in, off by default): enable it from the account bubble (admin) with the **Markdown mirror** switch, or `POST /api/settings` `{ mirrorEnabled: true }`. Turning it on backfills the vault from the DB, then every dump is appended to `mirror/dumps/YYYY-MM-DD.md` (local-time day files) the moment it persists. Idempotent (a dump-id marker prevents doubles), fire-and-forget, never blocks a memory write.
 - **Full vault export**: from the UI, open the account bubble (admin) and use **Export data → Vault (.zip)**; the full JSON backup sits next to it. Same thing via API: `GET /api/admin/export?format=vault` regenerates the whole vault from the DB — day files, one note per node under `nodes/<Type>/` with edges rendered as `[[wiki links]]`, forgotten nodes in `graveyard/`, plus a `00 - Sanctum.md` index — and downloads it as one zip. The build also sweeps files it didn't write, so disk ends matching the DB. `/api/admin/rebuild` runs this automatically at the end.
 - **Worst case**: Sanctum is gone, Neon is gone — `mirror/` still opens in Obsidian: every memory readable, the graph browsable. The JSON export (`/api/admin/export`, default) remains for full-fidelity backup; it also carries feedback and chat messages, which the vault intentionally leaves out.
 
@@ -187,7 +187,7 @@ All routes require a signed-in session except `/api/auth/*`, `GET /api/settings`
 | Route | Methods | What it does |
 | --- | --- | --- |
 | `/api/auth/*` | GET, POST | better-auth endpoints: email sign-up and sign-in, sign-out, session lookup |
-| `/api/settings` | GET, POST | GET is public: `{ signupEnabled }`. POST flips the signup switch, admin only |
+| `/api/settings` | GET, POST | GET is public: `{ signupEnabled, mirrorEnabled }`. POST flips either switch, admin only; enabling the mirror backfills the vault from the DB |
 | `/api/chat` | POST | Streamed chat with profile, open loops, salience-ranked recall, and silent memory writes |
 | `/api/chat/history` | GET | Rehydrate the current session's thread and title on page load |
 | `/api/dump` | POST | Extract nodes, edges, and updates from raw text into the graph |

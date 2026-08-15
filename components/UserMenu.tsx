@@ -4,13 +4,16 @@ import { useEffect, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 
 /** Account bubble in the chat header: glass modal with the signed-in profile,
- *  the admin-only "allow new sign-ups" switch, admin data exports (Obsidian
- *  vault zip / full JSON backup), and sign out. */
+ *  the admin-only "allow new sign-ups" switch, the opt-in markdown-mirror
+ *  switch (file-over-app write-through), admin data exports (Obsidian vault
+ *  zip / full JSON backup), and sign out. */
 export default function UserMenu() {
   const { data: session, isPending } = authClient.useSession();
   const [open, setOpen] = useState(false);
   const [signupEnabled, setSignupEnabled] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
+  const [mirrorEnabled, setMirrorEnabled] = useState<boolean | null>(null);
+  const [savingMirror, setSavingMirror] = useState(false);
   const [exporting, setExporting] = useState<"vault" | "json" | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -21,7 +24,11 @@ export default function UserMenu() {
     if (!open || !isAdmin) return;
     fetch("/api/settings")
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => d && setSignupEnabled(d.signupEnabled !== false))
+      .then((d) => {
+        if (!d) return;
+        setSignupEnabled(d.signupEnabled !== false);
+        setMirrorEnabled(d.mirrorEnabled === true);
+      })
       .catch(() => {});
   }, [open, isAdmin]);
 
@@ -39,6 +46,23 @@ export default function UserMenu() {
       setSignupEnabled(!next);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function toggleMirror(next: boolean) {
+    setMirrorEnabled(next); // optimistic
+    setSavingMirror(true);
+    try {
+      const r = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mirrorEnabled: next }),
+      });
+      if (!r.ok) setMirrorEnabled(!next); // revert
+    } catch {
+      setMirrorEnabled(!next);
+    } finally {
+      setSavingMirror(false);
     }
   }
 
@@ -131,6 +155,32 @@ export default function UserMenu() {
                     <span
                       className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
                         signupEnabled ? "left-[18px]" : "left-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="mt-4 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
+                  <div>
+                    <p className="text-sm text-slate-200">Markdown mirror</p>
+                    <p className="mt-0.5 text-[11px] leading-snug text-slate-500">
+                      Write new dumps through to mirror/ as plain-text day files;
+                      enabling also backfills the past ones. Off = database only
+                      (existing files stay).
+                    </p>
+                  </div>
+                  <button
+                    role="switch"
+                    aria-checked={mirrorEnabled === true}
+                    disabled={mirrorEnabled === null || savingMirror}
+                    onClick={() => toggleMirror(mirrorEnabled !== true)}
+                    className={`relative h-5 w-9 flex-none rounded-full transition ${
+                      mirrorEnabled ? "bg-indigo-500" : "bg-white/10"
+                    } disabled:opacity-50`}
+                  >
+                    <span
+                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                        mirrorEnabled ? "left-[18px]" : "left-0.5"
                       }`}
                     />
                   </button>
