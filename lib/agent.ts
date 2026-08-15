@@ -5,6 +5,7 @@ import { ai, CHAT_MODEL } from "./ai";
 import {
   persistExtraction,
   searchNodes,
+  nodesNamedIn,
   nodeEdges,
   recentNodes,
   findNode,
@@ -116,29 +117,47 @@ const MAX_RECALL_NODES = 8; // cap tokens
 const MAX_RECALL_EDGES = 16; // cap 1-hop neighborhood expansion
 const SALIENCE_WEIGHT = 0.08; // how much use boosts rank: ×(1 + ln(1+mentions)·w) — 30 mentions ≈ +27%
 const MAX_CHAT_HISTORY = 18; // messages sent to the model — digests cover the older stretches
+const RECENCY_WEIGHT = 0.15; // recently-surfaced memories get a small decaying boost (half-life ≈ 10 days)
+const daysSince = (d: Date | null | undefined) =>
+  d ? (Date.now() - new Date(d).getTime()) / 864e5 : 365; // never recalled → treated as old
 
 /**
- * Build memory context for a message: thresholded semantic search → salience rerank
- * → capped 1-hop neighborhood. The pinned profile node is excluded here (it's always
- * in context separately). Surfaced nodes get last_recalled_at stamped.
+ * Build memory context for a message: literal name mentions + thresholded semantic
+ * search → salience × recency rerank → capped 1-hop neighborhood. The pinned profile
+ * node is excluded here (it's always in context separately). Surfaced nodes get
+ * last_recalled_at stamped.
  */
 async function buildContext(
   query: string,
   excludeId?: string
 ): Promise<{ text: string; ids: string[]; names: Record<string, string> }> {
   if (!query.trim()) return { text: "(no query)", ids: [], names: {} };
-  const hits = await searchNodes(query, 12);
-  const nodes = hits
-    .filter((n) => n.score >= MIN_RECALL_SCORE && n.id !== excludeId)
-    // 🌱 salience rerank: memories that get used rise; untouched trivia sinks
-    .map((n) => ({ ...n, blended: n.score * (1 + Math.log1p(n.mention_count ?? 1) * SALIENCE_WEIGHT) }))
+  // Literal name mentions + vector search run together. A name in the query is a
+  // stronger signal than cosine — those nodes bypass the similarity floor.
+  const [hits, named] = await Promise.all([searchNodes(query, 12), nodesNamedIn(query)]);
+  const byId = new Map<string, { id: string; type: string; name: string; attrs: unknown; score: number; mention_count: number; last_recalled_at: Date | null }>();
+  for (const n of named) if (n.id !== excludeId) byId.set(n.id, { ...n, score: 1 });
+  for (const n of hits) {
+    if (n.id === excludeId || n.score < MIN_RECALL_SCORE) continue;
+    if (!byId.has(n.id)) byId.set(n.id, n);
+  }
+  const nodes = [...byId.values()]
+    // 🌱 salience × recency rerank: used memories rise, recently-surfaced ones get
+    // a small decaying boost, untouched trivia sinks
+    .map((n) => ({
+      ...n,
+      blended:
+        n.score *
+        (1 + Math.log1p(n.mention_count ?? 1) * SALIENCE_WEIGHT) *
+        (1 + RECENCY_WEIGHT * Math.exp(-daysSince(n.last_recalled_at) / 14.4)),
+    }))
     .sort((a, b) => b.blended - a.blended)
     .slice(0, MAX_RECALL_NODES);
   if (!nodes.length) {
     return { text: "(nothing in memory is relevant to this message)", ids: [], names: {} };
   }
   const ids = nodes.map((n) => n.id);
-  const edges = (await nodeEdges(ids)).slice(0, MAX_RECALL_EDGES);
+  const edges = await nodeEdges(ids, MAX_RECALL_EDGES); // newest-first, capped in SQL
   markRecalled(ids).catch(() => {}); // attention signal — fire-and-forget
   return {
     ids,
@@ -229,9 +248,18 @@ export async function chat(messages: ChatMessage[]) {
       .catch((e) => console.error("🧠 memory write failed:", e));
   }
 
+  // Recall from the last few user turns, not just the latest — follow-ups like
+  // "what did he say about it?" carry no entity names on their own.
+  const recallQuery =
+    messages
+      .filter((m) => m.role === "user")
+      .slice(-3)
+      .map((m) => m.content)
+      .join("\n") || lastUser;
+
   const [chatMd, ctx, loops, profileEdges] = await Promise.all([
     brain("chat.md"),
-    buildContext(lastUser, profile.id),
+    buildContext(recallQuery, profile.id),
     openLoops(),
     nodeEdges([profile.id]),
   ]);

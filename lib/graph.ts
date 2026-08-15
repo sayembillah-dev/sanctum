@@ -297,16 +297,34 @@ export async function recentNodes(limit = 20) {
 export async function searchNodes(question: string, limit = 5) {
   const vector = lit(await embed(question));
   return prisma.$queryRaw<
-    { id: string; type: string; name: string; attrs: unknown; score: number; mention_count: number }[]
+    { id: string; type: string; name: string; attrs: unknown; score: number; mention_count: number; last_recalled_at: Date | null }[]
   >`
-    select id, type, name, attrs, mention_count,
+    select id, type, name, attrs, mention_count, last_recalled_at,
            1 - (embedding <=> ${vector}::vector) as score
     from nodes where embedding is not null and valid_to is null
     order by embedding <=> ${vector}::vector limit ${limit}`;
 }
 
-/** Active edges touching any of the given live nodes (the 1-hop neighborhood). */
-export async function nodeEdges(ids: string[]) {
+/** Name-aware recall: live nodes whose name literally appears in the query text.
+ *  One query, no embedding — a question naming "Denowatts" must surface Denowatts
+ *  even when cosine similarity is lukewarm. Names under 3 chars are ignored. */
+export async function nodesNamedIn(text: string) {
+  if (!text.trim()) return [];
+  return prisma.$queryRaw<
+    { id: string; type: string; name: string; attrs: unknown; mention_count: number; last_recalled_at: Date | null }[]
+  >`
+    select id, type, name, attrs, mention_count, last_recalled_at
+    from nodes
+    where valid_to is null
+      and length(name) >= 3
+      and lower(${text}) like '%' || lower(name) || '%'
+    limit 20`;
+}
+
+/** Active edges touching any of the given live nodes (the 1-hop neighborhood).
+ *  Newest-said first; when `limit` is given the cap happens in SQL — the caller
+ *  no longer fetches everything and slices in JS. */
+export async function nodeEdges(ids: string[], limit?: number) {
   if (!ids.length) return [];
   const rows = await prisma.edge.findMany({
     where: {
@@ -315,6 +333,8 @@ export async function nodeEdges(ids: string[]) {
       src: { is: { valid_to: null } },
       dst: { is: { valid_to: null } },
     },
+    orderBy: { said_on: { sort: "desc", nulls: "last" } },
+    ...(limit ? { take: limit } : {}),
     select: {
       type: true,
       said_on: true,
