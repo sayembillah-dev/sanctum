@@ -96,7 +96,7 @@ Five feedback loops make every chat improve the next:
 
 ## Stack
 
-- Next.js 14 (App Router, UI plus API routes), React 18, TypeScript.
+- Next.js 16 (App Router, UI plus API routes), React 19, TypeScript.
 - Tailwind CSS and Ant Design 5 for the interface; react-force-graph-2d for the memory cosmos.
 - Prisma ORM as the typed client for all queries. DDL stays SQL-owned (`db/migrations/*.sql`, auto-applied on dev start) because Prisma cannot manage pgvector column types; embeddings are written via raw SQL. After schema changes, mirror them in `prisma/schema.prisma` and run `npx prisma generate`.
 - Neon Postgres with pgvector: the memory graph (`dumps`, `nodes`, `edges`) plus semantic search over 1536-dimension embeddings (pgvector HNSW caps at 2000 dims).
@@ -129,7 +129,7 @@ scripts/                migrate.mjs plus smoke tests (test-growth, test-memory-s
 
 ## Getting started
 
-Prerequisites: Node.js 18.17 or later, a Neon Postgres database with the pgvector extension, and an Azure Foundry endpoint with chat and embedding deployments.
+Prerequisites: Node.js 20.9 or later (required by Next.js 16), a Neon Postgres database with the pgvector extension, and an Azure Foundry endpoint with chat and embedding deployments.
 
 ~~~bash
 npm install              # postinstall runs prisma generate
