@@ -1,5 +1,11 @@
 import { summarizeConversation, extractFromStretch } from "@/lib/agent";
-import { currentSessionId, recentChatMessages, rotateSession } from "@/lib/graph";
+import {
+  currentSessionId,
+  recentChatMessages,
+  rotateSession,
+  sessionMessageCount,
+  markSessionSwept,
+} from "@/lib/graph";
 import { requireUser } from "@/lib/auth";
 
 export const maxDuration = 60;
@@ -21,6 +27,9 @@ export async function POST() {
     summarizeConversation(stretch), // self-rejects when < 4 substantive
     extractFromStretch(stretch), // self-rejects on empty stretch
   ]);
+  // Mark fully swept BEFORE rotating, so session-start healing doesn't
+  // re-extract this tail on the next session's first message.
+  await markSessionSwept(sessionId, await sessionMessageCount(sessionId)).catch(() => {});
   await rotateSession();
   return Response.json({
     digest: digest.status === "fulfilled" ? digest.value : { ok: false, error: String(digest.reason) },

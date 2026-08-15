@@ -16,6 +16,8 @@ import {
   sessionMessageCount,
   setSessionTitle,
   getSessionTitleInfo,
+  previousSession,
+  markSessionSwept,
 } from "@/lib/graph";
 
 // Digest cadence: every 12 persisted messages (= 6 user⇄assistant exchanges).
@@ -99,6 +101,22 @@ export async function POST(req: Request) {
   // the stream's finally block — writes can't be frozen mid-flight, and the
   // digest cadence always reads a fully persisted transcript.
   const postWork: (() => Promise<void>)[] = [];
+
+  // 🌙 Session-start healing: the PREVIOUS session may have ended below the
+  // 12-msg digest cadence without a clear-chat sweep (tab closed, wandered
+  // off) — every fact the remember tool skipped there is stranded in its
+  // transcript. Sweep the unswept tail now (queued, never delays this reply).
+  if (messages.length === 1) {
+    const prev = await previousSession(sessionId).catch(() => null);
+    if (prev && prev.msgs > prev.swept) {
+      postWork.push(async () => {
+        const tail = await recentChatMessages(prev.id, Math.min(16, prev.msgs - prev.swept + 4));
+        const r = await extractFromStretch(tail);
+        console.log("🌙 session-start sweep:", JSON.stringify(r));
+        await markSessionSwept(prev.id, prev.msgs);
+      });
+    }
+  }
 
   return new Response(
     new ReadableStream({
@@ -266,6 +284,7 @@ export async function POST(req: Request) {
                 else console.error("🌙 digest failed:", d.reason);
                 if (x.status === "fulfilled") console.log("🌙 digest-extract:", JSON.stringify(x.value));
                 else console.error("🌙 digest-extract failed:", x.reason);
+                await markSessionSwept(sessionId, count).catch(() => {});
               }
             }
           });

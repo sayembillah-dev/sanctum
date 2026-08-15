@@ -610,6 +610,32 @@ export async function appendChatMessage(
   await prisma.chatMessage.create({ data: { session_id: sessionId, role, content } });
 }
 
+// ── Fact-sweep bookkeeping (008): how much of each session extraction covered ──
+
+/** Mark a session swept up to `count` messages (monotonic — never regresses). */
+export async function markSessionSwept(sessionId: string, count: number): Promise<void> {
+  await prisma.$executeRaw`
+    update chat_sessions set swept_count = greatest(swept_count, ${count})
+    where id = ${sessionId}::uuid`;
+}
+
+/** The session before the current one + its sweep state — session-start healing
+ *  sweeps its unswept tail (facts the remember tool skipped and no cadence/
+ *  clear-chat net caught). Raw SQL: swept_count isn't in the prisma client yet. */
+export async function previousSession(
+  currentId: string
+): Promise<{ id: string; msgs: number; swept: number } | null> {
+  const rows = await prisma.$queryRaw<{ id: string; msgs: number; swept: number }[]>`
+    select s.id::text as id,
+           (select count(*)::int from chat_messages m where m.session_id = s.id) as msgs,
+           s.swept_count as swept
+    from chat_sessions s
+    where s.id <> ${currentId}::uuid
+    order by s.created_at desc
+    limit 1`;
+  return rows[0] ?? null;
+}
+
 /** Recent messages of a session, oldest-first — chat context + digest stretches. */
 export async function recentChatMessages(sessionId: string, limit = 40) {
   const rows = await prisma.chatMessage.findMany({
