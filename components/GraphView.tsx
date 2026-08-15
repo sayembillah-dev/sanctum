@@ -87,35 +87,14 @@ export default function GraphView() {
   const pulses = useRef<Map<string, number>>(new Map());
   const births = useRef<Map<string, number>>(new Map()); // node id → first-seen ts (bloom-in)
 
-  // ── 🕰️ time-travel ───────────────────────────────────────────────────
-  // asOf = null → live graph; otherwise the cosmos as it was at that moment.
-  // Minute resolution — the timelapse stays meaningful even when the whole
-  // graph was born a few hours ago.
-  const [asOf, setAsOf] = useState<number | null>(null); // epoch minutes
-  const asOfRef = useRef<string | null>(null); // ISO string for the API
-  const travelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [minTs, setMinTs] = useState<number | null>(null); // earliest node ts ever seen (stable range)
-  const nowMin = () => Math.floor(Date.now() / 60000);
-  const minTsMin = minTs === null ? null : Math.floor(minTs / 60000);
-  const fmtMin = (m: number) => {
-    const d = new Date(m * 60000);
-    const sameDay = d.toLocaleDateString("en-CA") === new Date().toLocaleDateString("en-CA");
-    return sameDay
-      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : d.toLocaleDateString("en-CA");
-  };
-
-  const travel = (m: number | null) => {
-    asOfRef.current = m === null ? null : new Date(m * 60000).toISOString();
-    setAsOf(m);
-    // debounce — dragging the slider fires a stream of changes
-    if (travelTimer.current) clearTimeout(travelTimer.current);
-    travelTimer.current = setTimeout(() => load(), 180);
-  };
-
-  // ── ▶ timelapse (Obsidian-style): auto-play the graph's growth ─────────
+  // ── 🕰️ timelapse — serial-based, not time-based ──────────────────────
+  // The cosmos replays in the order neurons were born (the snapshot arrives
+  // ordered by created_at). cut = how many of the first N nodes to show;
+  // null → live full graph. Pure client-side slicing: no fetches, no clocks.
+  const [cut, setCut] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prevVisible = useRef<Set<string>>(new Set());
 
   const stopPlay = () => {
     if (playRef.current) clearInterval(playRef.current);
@@ -125,22 +104,21 @@ export default function GraphView() {
 
   const play = () => {
     if (playing) return stopPlay();
-    if (minTsMin === null) return;
-    const start = minTsMin;
-    const end = nowMin();
-    const step = Math.max(1, Math.ceil((end - start) / 60)); // ≤ ~60 frames total
-    let cur = start;
+    const total = data.nodes.length;
+    if (total < 2) return;
+    const step = Math.max(1, Math.ceil(total / 60)); // ≤ ~60 frames
+    let cur = 1;
     setPlaying(true);
-    travel(cur);
+    setCut(1);
     playRef.current = setInterval(() => {
       cur += step;
-      if (cur >= end) {
+      if (cur >= total) {
         stopPlay();
-        travel(null); // land back on the live graph
+        setCut(null); // land back on the live graph
         return;
       }
-      travel(cur);
-    }, 650);
+      setCut(cur);
+    }, 350);
   };
 
   // ── node inspector ─────────────────────────────────────────────────────
@@ -217,6 +195,38 @@ export default function GraphView() {
     return m;
   }, [data]);
 
+  // Visible slice for the timelapse: first `cut` nodes (+ links between them).
+  // Nodes entering the window mid-scrub bloom in beside a visible neighbor.
+  const view = useMemo<GData>(() => {
+    const nodes = cut === null ? data.nodes : data.nodes.slice(0, cut);
+    const visible = new Set(nodes.map((n) => n.id));
+    if (prevVisible.current.size > 0) {
+      const now = performance.now();
+      for (const n of nodes) {
+        if (prevVisible.current.has(n.id) || n.x !== undefined) continue;
+        births.current.set(n.id, now);
+        pulses.current.set(n.id, now);
+        const nb = data.links.find((l) => {
+          const a = idOf(l.source);
+          const b = idOf(l.target);
+          return (a === n.id && visible.has(b)) || (b === n.id && visible.has(a));
+        });
+        const anchor = nb
+          ? nodes.find((m) => m.id === (idOf(nb.source) === n.id ? idOf(nb.target) : idOf(nb.source)))
+          : undefined;
+        if (anchor?.x !== undefined) {
+          n.x = anchor.x + (Math.random() - 0.5) * 40;
+          n.y = (anchor.y ?? 0) + (Math.random() - 0.5) * 40;
+        }
+      }
+    }
+    prevVisible.current = visible;
+    return {
+      nodes,
+      links: data.links.filter((l) => visible.has(idOf(l.source)) && visible.has(idOf(l.target))),
+    };
+  }, [data, cut]);
+
   const radiusOf = (n: GNode) => {
     const base = n.pinned ? 7 : 4.5;
     const deg = Math.min((degrees.get(n.id) ?? 0) * 0.7, 5);
@@ -242,15 +252,8 @@ export default function GraphView() {
   // ── data loading (dirty-window polling after activity) ───────────────────
   const load = async () => {
     try {
-      const q = asOfRef.current ? `?as_of=${encodeURIComponent(asOfRef.current)}` : "";
-      const r = await fetch(`/api/graph${q}`, { cache: "no-store" });
+      const r = await fetch("/api/graph", { cache: "no-store" });
       const d = (await r.json()) as GData;
-      for (const n of d.nodes) {
-        if (n.created) {
-          const ts = new Date(n.created).getTime();
-          setMinTs((prev) => (prev === null || ts < prev ? ts : prev)); // range never shrinks
-        }
-      }
       const nextSig =
         d.nodes
           .map((n) => `${n.id}:${n.name}:${n.type}:${n.pinned ? 1 : 0}:${n.mention_count ?? 0}`)
@@ -340,7 +343,7 @@ export default function GraphView() {
     <div className="relative h-full w-full">
       <ForceGraph2D
         ref={fgRef}
-        graphData={data}
+        graphData={view}
         backgroundColor={BASE_BG}
         warmupTicks={120}
         d3AlphaDecay={0.02}
@@ -455,10 +458,8 @@ export default function GraphView() {
         {data.nodes.length} neurons · {data.links.length} synapses
       </div>
 
-      {/* 🕰️ time-travel — scrub the cosmos back through its history.
-          Always visible once the graph loads (minute resolution works even
-          when every node was created today). */}
-      {minTsMin !== null && data.nodes.length > 0 && (
+      {/* 🕰️ timelapse — replay the cosmos in birth order (node #1 → #N) */}
+      {data.nodes.length > 1 && (
         <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur">
           <button
             onClick={play}
@@ -471,32 +472,33 @@ export default function GraphView() {
           >
             {playing ? "⏸" : "▶"}
           </button>
-          <span className="text-[11px]" title="Time-travel: the graph as it was">
+          <span className="text-[11px]" title="Replay in the order neurons were born">
             🕰️
           </span>
           <input
             type="range"
-            aria-label="Travel to a past moment"
+            aria-label="Show the first N neurons"
             className="h-1 w-40 cursor-pointer accent-indigo-400"
-            min={minTsMin}
-            max={nowMin()}
-            value={asOf ?? nowMin()}
+            min={1}
+            max={data.nodes.length}
+            value={cut ?? data.nodes.length}
             onChange={(e) => {
               stopPlay(); // manual scrub wins over playback
               const v = Number(e.target.value);
-              travel(v >= nowMin() ? null : v);
+              setCut(v >= data.nodes.length ? null : v);
             }}
           />
           <span
             className={`min-w-[4.5rem] text-center text-[11px] tabular-nums ${
-              asOf !== null ? "text-amber-300" : "text-slate-400"
+              cut !== null ? "text-amber-300" : "text-slate-400"
             }`}
+            title={cut !== null ? data.nodes[cut - 1]?.created : undefined}
           >
-            {asOf === null ? "now" : fmtMin(asOf)}
+            {cut === null ? "now" : `#${cut} / ${data.nodes.length}`}
           </span>
-          {asOf !== null && (
+          {cut !== null && (
             <button
-              onClick={() => travel(null)}
+              onClick={() => setCut(null)}
               className="rounded-full border border-amber-300/30 px-2 py-0.5 text-[10px] text-amber-300 transition hover:bg-amber-400/10"
             >
               back to now
