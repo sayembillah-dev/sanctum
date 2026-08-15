@@ -127,6 +127,9 @@ export default function Chat() {
         const snapshot = acc;
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: snapshot }]);
       }
+      // reply complete — let the graph light every neuron the reply NAMES
+      // (recall misses nodes whose facts ride on profile attrs, e.g. father)
+      if (acc.trim()) window.dispatchEvent(new CustomEvent("sanctum:reply", { detail: acc }));
     } catch {
       if (abort.signal.aborted) {
         // user hit stop — keep whatever reply streamed in

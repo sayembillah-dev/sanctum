@@ -369,14 +369,33 @@ export default function GraphView() {
         if (s.has(a) && s.has(b)) linkPulses.current.set(`${a}|${b}`, now);
       }
     };
+    // reply-grounded glow: any neuron the reply TEXT names lights up, recall
+    // or not — honest grounding for answers sourced from profile attrs
+    const onReply = (e: Event) => {
+      const text = String((e as CustomEvent).detail ?? "").toLowerCase();
+      if (!text) return;
+      const now = performance.now();
+      const s = new Set<string>();
+      for (const n of dataRef.current.nodes) {
+        if (n.pinned || (n.name.length >= 3 && text.includes(n.name.toLowerCase()))) s.add(n.id);
+      }
+      s.forEach((id) => pulses.current.set(id, now));
+      for (const l of dataRef.current.links) {
+        const a = idOf(l.source);
+        const b = idOf(l.target);
+        if (s.has(a) && s.has(b)) linkPulses.current.set(`${a}|${b}`, now);
+      }
+    };
     window.addEventListener("sanctum:dirty", onDirty);
     window.addEventListener("sanctum:recalled", onRecalled);
+    window.addEventListener("sanctum:reply", onReply);
     const t = setInterval(() => {
       if (Date.now() < dirtyUntil.current) load();
     }, 2000);
     return () => {
       window.removeEventListener("sanctum:dirty", onDirty);
       window.removeEventListener("sanctum:recalled", onRecalled);
+      window.removeEventListener("sanctum:reply", onReply);
       clearInterval(t);
       if (playRef.current !== null) cancelAnimationFrame(playRef.current);
     };
@@ -486,9 +505,9 @@ export default function GraphView() {
           const eK = 1 + 2.70158 * Math.pow(birthF - 1, 3) + 1.70158 * Math.pow(birthF - 1, 2);
 
           // halo — radial gradient, fades to nothing (no hard edge)
-          const haloR = r * (2.1 + 1.2 * boost) * eK;
+          const haloR = r * (2.1 + 2.6 * boost) * eK;
           const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
-          g.addColorStop(0, `rgba(${cr},${cg},${cb},${(mix(boost > 0 ? 0.19 : 0.1, 0.028, dimF) * eB).toFixed(3)})`);
+          g.addColorStop(0, `rgba(${cr},${cg},${cb},${(mix(boost > 0 ? 0.55 : 0.1, 0.028, dimF) * eB).toFixed(3)})`);
           g.addColorStop(1, color + "00");
           ctx.fillStyle = g;
           ctx.beginPath();
@@ -497,9 +516,16 @@ export default function GraphView() {
 
           // core
           ctx.beginPath();
-          ctx.arc(n.x, n.y, r * (1 + 0.25 * boost) * eK, 0, Math.PI * 2);
+          ctx.arc(n.x, n.y, r * (1 + 0.5 * boost) * eK, 0, Math.PI * 2);
           ctx.fillStyle = `rgba(${cr},${cg},${cb},${(mix(1, 0.14, dimF) * eB).toFixed(3)})`;
           ctx.fill();
+          // white-hot heart while the pulse is strong — the "glow" read
+          if (boost > 0.05) {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, r * 0.55 * eK, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255,255,255,${(0.55 * boost).toFixed(3)})`;
+            ctx.fill();
+          }
 
           // label — constant screen size, hidden when far zoomed out
           if (scale > 0.45) {
