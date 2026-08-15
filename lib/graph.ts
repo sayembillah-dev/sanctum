@@ -456,17 +456,19 @@ export async function recentNegativeFeedback(take = 10) {
 
 /** Full live-graph snapshot for the neuron view (force-graph wants { nodes, links }). */
 export async function graphSnapshot() {
-  const [nodes, edges] = await Promise.all([
-    prisma.node.findMany({
-      where: { valid_to: null },
-      orderBy: { created_at: "asc" },
-      select: { id: true, type: true, name: true, pinned: true, mention_count: true },
-    }),
-    prisma.edge.findMany({
+  // Conversation digests stay in recall but never render in the cosmos
+  const nodes = await prisma.node.findMany({
+    where: { valid_to: null, type: { not: "Conversation" } },
+    orderBy: { created_at: "asc" },
+    select: { id: true, type: true, name: true, pinned: true, mention_count: true },
+  });
+  const ids = new Set(nodes.map((n) => n.id));
+  const edges = (
+    await prisma.edge.findMany({
       where: { valid_to: null },
       select: { src_id: true, dst_id: true, type: true },
-    }),
-  ]);
+    })
+  ).filter((e) => ids.has(e.src_id) && ids.has(e.dst_id));
   return {
     nodes,
     links: edges.map((e) => ({ source: e.src_id, target: e.dst_id, type: e.type })),
