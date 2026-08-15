@@ -1,0 +1,353 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+type Msg = { role: "user" | "assistant"; content: string };
+type Recap = {
+  newNodes: number;
+  newEdges: number;
+  byType: Record<string, number>;
+  newest: { name: string; type: string }[];
+  topMentioned: { name: string; type: string; mention_count: number }[];
+  feedback: { up: number; down: number };
+};
+
+export default function Chat() {
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fb, setFb] = useState<Record<number, 1 | -1>>({}); // msg index → rating given
+  const [recap, setRecap] = useState<Recap | "loading" | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // auto-growing composer
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  }, [input]);
+
+  // error toast auto-dismiss
+  useEffect(() => {
+    if (!error) return;
+    const t = setTimeout(() => setError(null), 4000);
+    return () => clearTimeout(t);
+  }, [error]);
+
+  // clear-chat confirm auto-resets after 3s
+  const [confirmClear, setConfirmClear] = useState(false);
+  useEffect(() => {
+    if (!confirmClear) return;
+    const t = setTimeout(() => setConfirmClear(false), 3000);
+    return () => clearTimeout(t);
+  }, [confirmClear]);
+
+  function clearChat() {
+    if (!confirmClear) return setConfirmClear(true);
+    // 🌙 session ended — crystallize it into a memory digest node (fire-and-forget)
+    if (messages.length >= 4) {
+      fetch("/api/conversations/digest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages }),
+      })
+        .then(() => window.dispatchEvent(new Event("sanctum:dirty")))
+        .catch(() => {});
+    }
+    setMessages([]);
+    setFb({});
+    setError(null);
+    setConfirmClear(false);
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    const history: Msg[] = [...messages, { role: "user", content: text }];
+    setMessages([...history, { role: "assistant", content: "" }]);
+    setInput("");
+    // memory write starts server-side now → wake the graph view
+    window.dispatchEvent(new Event("sanctum:dirty"));
+    setBusy(true);
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history }),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const recalled = res.headers.get("X-Recalled-Nodes");
+      if (recalled) {
+        window.dispatchEvent(new CustomEvent("sanctum:recalled", { detail: JSON.parse(recalled) }));
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        const snapshot = acc;
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: snapshot }]);
+      }
+    } catch {
+      setError("Connection hiccup — that message didn't land. Try again.");
+      setMessages(history);
+    } finally {
+      setBusy(false);
+      // extraction may still be landing after the stream ends — keep the graph watching
+      window.dispatchEvent(new Event("sanctum:dirty"));
+    }
+  }
+
+  // 👍/👎 — teaches Sanctum what good looks like (read by the consolidation cycle)
+  async function sendFeedback(i: number, rating: 1 | -1) {
+    if (fb[i]) return;
+    setFb((p) => ({ ...p, [i]: rating }));
+    const userMsg = messages[i - 1]?.role === "user" ? messages[i - 1].content : "";
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rating, userMsg, assistantMsg: messages[i].content }),
+      });
+    } catch {
+      /* non-critical — feedback is a gift, not a guarantee */
+    }
+  }
+
+  async function loadRecap() {
+    setRecap("loading");
+    try {
+      const r = await fetch("/api/recap", { cache: "no-store" });
+      setRecap(await r.json());
+    } catch {
+      setRecap(null);
+    }
+  }
+
+  const waiting =
+    busy && messages.at(-1)?.role === "assistant" && !messages.at(-1)?.content;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* messages */}
+      <div className="relative min-h-0 flex-1">
+        <button
+          onClick={loadRecap}
+          title="What Sanctum learned this week"
+          className="absolute left-3 top-3 z-10 rounded-full border border-white/10 bg-[#0a0a18]/80 px-3 py-1.5 text-[11px] text-slate-400 backdrop-blur-md transition hover:border-amber-300/40 hover:text-amber-300"
+        >
+          ✨ Week
+        </button>
+        {messages.length > 0 && (
+          <button
+            onClick={clearChat}
+            disabled={busy}
+            title="End this session — it's saved as a memory digest"
+            className={`absolute right-3 top-3 z-10 rounded-full border px-3 py-1.5 text-[11px] backdrop-blur-md transition disabled:opacity-40 ${
+              confirmClear
+                ? "border-rose-400/40 bg-rose-500/15 text-rose-300"
+                : "border-white/10 bg-[#0a0a18]/80 text-slate-400 hover:border-rose-400/40 hover:text-rose-300"
+            }`}
+          >
+            {confirmClear ? "Sure?" : "✕ Clear"}
+          </button>
+        )}
+
+        {/* ✨ weekly recap overlay — growth made visible */}
+        {recap !== null && (
+          <div
+            className="absolute inset-0 z-20 flex items-center justify-center bg-[#05050f]/70 p-4 backdrop-blur-sm"
+            onClick={() => setRecap(null)}
+          >
+            <div
+              className="msg-in max-h-full w-full max-w-[330px] overflow-y-auto rounded-2xl border border-white/10 bg-[#0a0a18]/95 p-4 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {recap === "loading" ? (
+                <p className="py-6 text-center text-xs text-slate-500">gathering stardust…</p>
+              ) : (
+                <>
+                  <h3 className="font-display text-sm font-semibold text-white">
+                    ✨ This week I learned
+                  </h3>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {recap.newNodes} new neurons · {recap.newEdges} new synapses
+                    {recap.feedback.up + recap.feedback.down > 0 &&
+                      ` · ${recap.feedback.up}👍 ${recap.feedback.down}👎`}
+                  </p>
+                  {Object.keys(recap.byType).length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {Object.entries(recap.byType).map(([t, c]) => (
+                        <span
+                          key={t}
+                          className="rounded-full border border-white/10 bg-white/[0.05] px-2 py-0.5 text-[10px] text-slate-300"
+                        >
+                          {t} ×{c}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {recap.newest.length > 0 && (
+                    <>
+                      <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                        Newest
+                      </p>
+                      <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
+                        {recap.newest.map((n) => (
+                          <li key={n.name} className="truncate">
+                            <span className="text-slate-500">{n.type} ·</span> {n.name}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  {recap.topMentioned.length > 0 && (
+                    <>
+                      <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                        On your mind
+                      </p>
+                      <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
+                        {recap.topMentioned.map((n) => (
+                          <li key={n.name} className="truncate">
+                            {n.name} <span className="text-slate-600">×{n.mention_count}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  <p className="mt-4 text-center text-[10px] text-slate-600">tap outside to close</p>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="msg-scroll h-full overflow-y-auto px-4 py-4">
+        {messages.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center gap-5 text-center">
+            <div className="orb" />
+            <div>
+              <h2 className="font-display text-lg font-semibold text-white">
+                What&apos;s on your mind?
+              </h2>
+              <p className="mx-auto mt-2 max-w-[270px] text-xs leading-relaxed text-slate-400">
+                Talk to me — I&apos;ll remember everything, silently. The more we
+                chat, the better I know you. ✨
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 pt-8">
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                className={`msg-in group flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                <div className="max-w-[85%]">
+                  <div
+                    className={
+                      m.role === "user"
+                        ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-gradient-to-br from-indigo-500 to-violet-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-[0_6px_24px_-6px_rgba(99,102,241,0.5)]"
+                        : "whitespace-pre-wrap rounded-2xl rounded-bl-md border border-white/[0.08] bg-white/[0.05] px-4 py-2.5 text-sm leading-relaxed text-slate-200"
+                    }
+                  >
+                    {m.content ||
+                      (waiting && i === messages.length - 1 ? (
+                        <span className="flex items-center gap-1.5 py-1">
+                          <span className="typing-dot" />
+                          <span className="typing-dot" />
+                          <span className="typing-dot" />
+                        </span>
+                      ) : null)}
+                  </div>
+                  {m.role === "assistant" && m.content && !(busy && i === messages.length - 1) && (
+                    <div className="mt-1 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                      {([1, -1] as const).map((r) => (
+                        <button
+                          key={r}
+                          onClick={() => sendFeedback(i, r)}
+                          title={r === 1 ? "Good reply" : "Not great — Sanctum will adjust"}
+                          className={`rounded-md px-1.5 py-0.5 text-[11px] transition ${
+                            fb[i] === r
+                              ? r === 1
+                                ? "bg-emerald-500/15 text-emerald-300"
+                                : "bg-rose-500/15 text-rose-300"
+                              : "text-slate-600 hover:bg-white/[0.06] hover:text-slate-300"
+                          }`}
+                        >
+                          {r === 1 ? "👍" : "👎"}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        <div ref={bottomRef} />
+        </div>
+      </div>
+
+      {/* error toast */}
+      {error && (
+        <div className="msg-in mx-4 mb-2 rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          {error}
+        </div>
+      )}
+
+      {/* composer */}
+      <div className="px-4 pb-4">
+        <div className="flex items-end gap-2 rounded-2xl border border-white/10 bg-white/[0.05] p-2 transition focus-within:border-indigo-400/50 focus-within:shadow-[0_0_0_1px_rgba(99,102,241,0.25),0_8px_32px_-8px_rgba(99,102,241,0.35)]">
+          <textarea
+            ref={taRef}
+            rows={1}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            placeholder="Say anything…"
+            disabled={busy}
+            className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500 disabled:opacity-50"
+          />
+          <button
+            onClick={send}
+            disabled={busy || !input.trim()}
+            aria-label="Send"
+            className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow-lg shadow-indigo-500/30 transition hover:brightness-110 active:scale-95 disabled:opacity-30 disabled:shadow-none"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 19V5" />
+              <path d="m5 12 7-7 7 7" />
+            </svg>
+          </button>
+        </div>
+        <p className="mt-2 text-center text-[10px] tracking-wide text-slate-600">
+          Enter to send · Shift + Enter for a new line
+        </p>
+      </div>
+    </div>
+  );
+}
