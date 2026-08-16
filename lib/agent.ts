@@ -411,10 +411,23 @@ function isTrivialPrompt(text: string): boolean {
   return TRIVIAL_PROMPT_RE.test(s);
 }
 
+/** Referential markers: a message containing these may depend on earlier turns,
+ *  so it earns a query rewrite. Without them the raw 3-turn concat retrieves as
+ *  well as the rewrite would — skipping saves a full LLM call per message. */
+const FOLLOWUP_RE =
+  /\b(he|him|his|she|her|it|its|they|them|their|theirs|that|this|those|these|there|then|earlier|above|former|latter)\b/i;
+
+function needsRewrite(text: string): boolean {
+  if (FOLLOWUP_RE.test(text)) return true;
+  // Bare fragments ("yarn?") get a rewrite; standalone questions/statements don't
+  return text.trim().split(/\s+/).length < 4 && !QUESTION_START.test(text.trim());
+}
+
 export async function chat(messages: ChatMessage[]) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
 
-  const profile = await ensureProfile();
+  // Kicked off, not awaited — it joins the Promise.all below (was a serial round trip).
+  const profileP = ensureProfile();
 
   // Recall from the last few user turns, not just the latest — follow-ups like
   // "what did he say about it?" carry no entity names on their own.
@@ -430,14 +443,17 @@ export async function chat(messages: ChatMessage[]) {
 
   // M6: the rewrite call runs CONCURRENTLY with the other context fetches —
   // only buildContext depends on it, so it adds ~0 wall-clock latency.
-  const rewriteP = trivial ? Promise.resolve(null) : rewriteRecallQuery(messages);
+  // Gated: standalone messages (no pronouns/references) retrieve fine on the raw
+  // 3-turn concat — the rewrite LLM call is skipped entirely for them.
+  const rewriteP = trivial || !needsRewrite(lastUser) ? Promise.resolve(null) : rewriteRecallQuery(messages);
 
-  const [chatMd, loops, profileEdges, rewritten] = await Promise.all([
+  const [profile, chatMd, loops, rewritten] = await Promise.all([
+    profileP,
     brain("chat.md"),
     openLoops(),
-    nodeEdges([profile.id]),
     rewriteP,
   ]);
+  const profileEdges = await nodeEdges([profile.id]); // needs profile.id — resolves right after
 
   const recallQuery = rewritten ?? rawRecallQuery;
   if (rewritten) console.log("🧠 recall query rewritten:", rewritten.slice(0, 120));
