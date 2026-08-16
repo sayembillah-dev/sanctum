@@ -134,6 +134,59 @@ export default function GraphView() {
   const linkPulses = useRef<Map<string, number>>(new Map()); // "a|b" → recall-pulse ts (AI used this synapse)
   const dataRef = useRef<GData>({ nodes: [], links: [] }); // latest snapshot for once-registered handlers
 
+  // ── C10: idle sleep ─────────────────────────────────────────────────────
+  // cooldownTime=Infinity keeps the engine repainting at 60fps forever (the
+  // starfield). When NOTHING is animating and the sim has physically settled,
+  // pauseAnimation() drops the canvas to 0fps — zero CPU/GPU while idle.
+  // wake() on any interaction/event; the 500ms watcher below both puts it to
+  // sleep and revives it (self-healing if a wake() was somehow missed).
+  const asleep = useRef(false);
+  const lastActivity = useRef(Date.now()); // boot grace: never sleeps instantly
+  const lastPos = useRef<Float64Array | null>(null); // node x/y sampler (settle detection)
+  const hoverRef = useRef<string | null>(null); // hover state readable from the watcher
+
+  const wake = () => {
+    lastActivity.current = Date.now();
+    if (asleep.current) {
+      asleep.current = false;
+      fgRef.current?.resumeAnimation?.();
+    }
+  };
+  /** Anything animating right now? (self-cleaning maps can only drain while painting) */
+  const anyAnimating = () =>
+    pulses.current.size > 0 ||
+    births.current.size > 0 ||
+    pops.current.size > 0 ||
+    linkBirths.current.size > 0 ||
+    linkPulses.current.size > 0 ||
+    dimMap.current.size > 0 ||
+    linkFx.current.size > 0 ||
+    hoverRef.current !== null ||
+    playRef.current !== null;
+  /** Has the cosmos physically moved since the last sample? (sim settle detection) */
+  const moved = () => {
+    const ns = dataRef.current.nodes;
+    let lp = lastPos.current;
+    if (!lp || lp.length !== ns.length * 2) {
+      lp = new Float64Array(ns.length * 2);
+      lastPos.current = lp;
+      for (let i = 0; i < ns.length; i++) {
+        lp[i * 2] = ns[i].x ?? 0;
+        lp[i * 2 + 1] = ns[i].y ?? 0;
+      }
+      return true; // layout changed shape — treat as movement
+    }
+    let sum = 0;
+    for (let i = 0; i < ns.length; i++) {
+      const x = ns[i].x ?? 0;
+      const y = ns[i].y ?? 0;
+      sum += Math.abs(x - lp[i * 2]) + Math.abs(y - lp[i * 2 + 1]);
+      lp[i * 2] = x;
+      lp[i * 2 + 1] = y;
+    }
+    return sum > 0.75; // total drift (px) across the whole cosmos per 500ms
+  };
+
   const stopPlay = () => {
     if (playRef.current !== null) cancelAnimationFrame(playRef.current);
     playRef.current = null;
@@ -144,6 +197,7 @@ export default function GraphView() {
   // time (~130ms each) instead of N/60 bursts — that's what makes it read as
   // growth rather than chunks. setCut only re-renders when the integer changes.
   const play = () => {
+    wake();
     if (playing) return stopPlay();
     const total = data.nodes.length;
     if (total < 2) return;
@@ -331,6 +385,7 @@ export default function GraphView() {
         d.links.map((l) => `${idOf(l.source)}>${idOf(l.target)}:${l.type}`).sort().join("|");
       if (nextSig === sig.current) return;
       sig.current = nextSig;
+      wake(); // data actually changed — births/pops/physics are coming
       setData((prev) => {
         const old = new Map(prev.nodes.map((n) => [n.id, n]));
         const alive = new Set(d.nodes.map((n) => n.id));
@@ -380,10 +435,12 @@ export default function GraphView() {
   useEffect(() => {
     load();
     const onDirty = () => {
+      wake();
       dirtyUntil.current = Date.now() + 8000;
       load();
     };
     const onRecalled = (e: Event) => {
+      wake(); // pulses/linkPulses below must be able to animate
       // Chat.tsx dispatches detail = the id ARRAY itself (not { ids }) — the
       // old detail?.ids read silently yielded [] and pulses never fired at all
       const d = (e as CustomEvent).detail;
@@ -406,6 +463,7 @@ export default function GraphView() {
     // reply-grounded glow: any neuron the reply TEXT names lights up, recall
     // or not — honest grounding for answers sourced from profile attrs
     const onReply = (e: Event) => {
+      wake();
       const text = String((e as CustomEvent).detail ?? "").toLowerCase();
       if (!text) return;
       const now = performance.now();
@@ -433,6 +491,24 @@ export default function GraphView() {
       clearInterval(t);
       if (playRef.current !== null) cancelAnimationFrame(playRef.current);
     };
+  }, []);
+
+  // C10 watcher: sleep when settled + idle; revive if anything wakes up.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const fg = fgRef.current;
+      if (!fg) return;
+      const busyView = Date.now() - lastActivity.current < 800 || anyAnimating() || moved();
+      if (!busyView && !asleep.current) {
+        asleep.current = true;
+        fg.pauseAnimation?.();
+      } else if (busyView && asleep.current) {
+        asleep.current = false;
+        fg.resumeAnimation?.();
+      }
+    }, 500);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // fit on first load; gently reheat + refit when the brain grows
@@ -464,18 +540,28 @@ export default function GraphView() {
         // canvas simply STOPS painting between state changes — that's what made
         // the timelapse (and the starfield) jump instead of animate smoothly.
         enableNodeDrag
+        onNodeDrag={() => wake()}
+        onZoom={() => wake()}
         onNodeDragEnd={(n: any) => {
+          wake();
           delete n.fx; // release → the live sim bounces it back into the disc
           delete n.fy;
           fgRef.current?.d3ReheatSimulation?.();
         }}
-        onNodeClick={(n: any) => inspect(n as GNode)}
-        onBackgroundClick={() => setSelected(null)}
+        onNodeClick={(n: any) => {
+          wake();
+          inspect(n as GNode);
+        }}
+        onBackgroundClick={() => {
+          wake();
+          setSelected(null);
+        }}
         // ── cosmic backdrop: twinkling stars + vignette (screen space) ──
         onRenderFramePre={(ctx: CanvasRenderingContext2D) => {
           const w = ctx.canvas.width;
           const h = ctx.canvas.height;
-          const now = performance.now() / 1000;
+          // C10: twinkle stepped at ~30Hz — imperceptible vs 60, halves phase churn
+          const now = Math.floor(performance.now() / 33.4) * 0.0334;
           ctx.save();
           ctx.setTransform(1, 0, 0, 1, 0, 0);
           for (const s of STARS) {
@@ -582,7 +668,12 @@ export default function GraphView() {
           ctx.arc(n.x, n.y, radiusOf(n) + 6, 0, Math.PI * 2);
           ctx.fill();
         }}
-        onNodeHover={(n: any) => setHover(n ? (n as GNode).id : null)}
+        onNodeHover={(n: any) => {
+          const id = n ? (n as GNode).id : null;
+          hoverRef.current = id;
+          setHover(id);
+          wake(); // hover drives dim/linkFx lerps — must be painting
+        }}
         linkColor={(l: any) => {
           const a = idOf(l.source);
           const b = idOf(l.target);
@@ -647,6 +738,7 @@ export default function GraphView() {
             max={data.nodes.length}
             value={cut ?? data.nodes.length}
             onChange={(e) => {
+              wake();
               stopPlay(); // manual scrub wins over playback
               const v = Number(e.target.value);
               setCut(v >= data.nodes.length ? null : v);
@@ -662,7 +754,10 @@ export default function GraphView() {
           </span>
           {cut !== null && (
             <button
-              onClick={() => setCut(null)}
+              onClick={() => {
+                wake();
+                setCut(null);
+              }}
               className="rounded-full border border-amber-300/30 px-2 py-0.5 text-[10px] text-amber-300 transition hover:bg-amber-400/10"
             >
               back to now
