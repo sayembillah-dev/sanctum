@@ -850,17 +850,37 @@ export async function weeklyRecap() {
 // ─── Consolidation helpers (the sleep cycle) ───
 
 /** Embedding-similar live node pairs — merge candidates for the consolidation agent. */
+// Round-2 opt B8: per-node top-3 KNN riding the HNSW index (cross join lateral)
+// instead of an O(n^2) self-join over every live pair. A pair surfaces twice when
+// each endpoint is in the other's top-3 — deduped in JS. Same output contract:
+// sim >= minSim, sim desc, cap 20. (Trade-off: a node with >3 neighbors above
+// minSim only reports its nearest 3 — fine for merge-candidate discovery.)
 export async function dupeCandidates(minSim = 0.8) {
-  return prisma.$queryRaw<{ a_id: string; a_name: string; b_id: string; b_name: string; sim: number }[]>`
+  const rows = await prisma.$queryRaw<{ a_id: string; a_name: string; b_id: string; b_name: string; sim: number }[]>`
     select a.id as a_id, a.name as a_name, b.id as b_id, b.name as b_name,
            1 - (a.embedding <=> b.embedding) as sim
     from nodes a
-    join nodes b on a.id < b.id
-    where a.valid_to is null and b.valid_to is null
-      and a.embedding is not null and b.embedding is not null
+    cross join lateral (
+      select b.id, b.name, b.embedding
+      from nodes b
+      where b.valid_to is null and b.embedding is not null and b.id <> a.id
+      order by b.embedding <=> a.embedding
+      limit 3
+    ) b
+    where a.valid_to is null and a.embedding is not null
       and 1 - (a.embedding <=> b.embedding) >= ${minSim}
     order by sim desc
-    limit 20`;
+    limit 40`;
+  const seen = new Set<string>();
+  const out: typeof rows = [];
+  for (const r of rows) {
+    const key = r.a_id < r.b_id ? `${r.a_id}|${r.b_id}` : `${r.b_id}|${r.a_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+    if (out.length >= 20) break;
+  }
+  return out;
 }
 
 /**
