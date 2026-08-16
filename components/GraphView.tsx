@@ -85,6 +85,7 @@ export default function GraphView() {
   const fgRef = useRef<any>(null);
   const [data, setData] = useState<GData>({ nodes: [], links: [] });
   const sig = useRef("");
+  const ver = useRef<string | null>(null); // B6: last-seen graph version (304 probe)
   const fitted = useRef(false);
   const prevCount = useRef(0);
   const dirtyUntil = useRef(0);
@@ -286,8 +287,13 @@ export default function GraphView() {
   // ── data loading (dirty-window polling after activity) ───────────────────
   const load = async () => {
     try {
-      const r = await fetch("/api/graph", { cache: "no-store" });
+      // B6: send the last-seen version — 304 means the graph is unchanged,
+      // keep the cosmos exactly as-is (skip parse + signature + merge).
+      const q = ver.current ? `?v=${encodeURIComponent(ver.current)}` : "";
+      const r = await fetch(`/api/graph${q}`, { cache: "no-store" });
+      if (r.status === 304) return;
       const d = (await r.json()) as GData;
+      ver.current = r.headers.get("X-Graph-Version") ?? ver.current;
       const nextSig =
         d.nodes
           .map((n) => `${n.id}:${n.name}:${n.type}:${n.pinned ? 1 : 0}:${n.mention_count ?? 0}`)

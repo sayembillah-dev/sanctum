@@ -950,6 +950,26 @@ export async function recentNegativeFeedback(take = 10) {
   });
 }
 
+/** Round-2 opt B6: cheap change-probe for the cosmos. The client sends the last
+ *  version it saw (?v=…); /api/graph answers 304 when this still matches, so idle
+ *  polling costs one indexed aggregate instead of a full snapshot read.
+ *  Busts on: node create (count), forget/merge (valid_to count), rename/attr/task
+ *  edits (max updated_at), strengthen (sum mention_count), edge create/close.
+ *  Conversation digests are excluded from the node probes (they never render),
+ *  matching graphSnapshot's live-mode filter — so digest cadence doesn't refetch. */
+export async function graphVersion(): Promise<string> {
+  const rows = await prisma.$queryRaw<{ v: string }[]>`
+    select concat_ws('.',
+      (select count(*)::text from nodes where type <> 'Conversation'),
+      (select coalesce(sum(mention_count), 0)::text from nodes where type <> 'Conversation'),
+      (select coalesce(extract(epoch from max(updated_at))::bigint, 0)::text from nodes where type <> 'Conversation'),
+      (select count(*)::text from nodes where valid_to is not null),
+      (select count(*)::text from edges),
+      (select count(*)::text from edges where valid_to is not null)
+    ) as v`;
+  return rows[0]?.v ?? "0";
+}
+
 /** Full live-graph snapshot for the neuron view (force-graph wants { nodes, links }).
  *  🕰️ Time-travel: pass asOf (YYYY-MM-DD) for the graph as it was at the end of
  *  that day — later arrivals vanish, since-forgotten nodes return. The bi-temporal
