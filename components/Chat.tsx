@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 
 type Msg = { role: "user" | "assistant"; content: string };
 type Task = {
@@ -22,6 +22,70 @@ type Recap = {
   latestDigest: { name: string; summary: string; date: string } | null;
 };
 
+/** C9: memoized message bubble. The thread is append-only with index keys and
+ *  streaming only replaces the LAST message object, so every older bubble keeps
+ *  reference identity and skips re-render entirely — previously the whole thread
+ *  re-rendered on every streamed chunk. typing/streaming/rating are per-bubble
+ *  booleans so busy/waiting flips only reach the last bubble. */
+const MessageBubble = memo(function MessageBubble({
+  m,
+  index,
+  typing,
+  streaming,
+  rating,
+  onFeedback,
+}: {
+  m: Msg;
+  index: number;
+  typing: boolean; // waiting dots (last bubble only)
+  streaming: boolean; // still streaming (last bubble only) — hides feedback
+  rating: 1 | -1 | undefined;
+  onFeedback: (i: number, r: 1 | -1) => void;
+}) {
+  return (
+    <div className={`msg-in group flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+      <div className="max-w-[85%]">
+        <div
+          className={
+            m.role === "user"
+              ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-gradient-to-br from-indigo-500 to-violet-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-[0_6px_24px_-6px_rgba(99,102,241,0.5)]"
+              : "whitespace-pre-wrap rounded-2xl rounded-bl-md border border-white/[0.08] bg-white/[0.05] px-4 py-2.5 text-sm leading-relaxed text-slate-200"
+          }
+        >
+          {m.content ||
+            (typing ? (
+              <span className="flex items-center gap-1.5 py-1">
+                <span className="typing-dot" />
+                <span className="typing-dot" />
+                <span className="typing-dot" />
+              </span>
+            ) : null)}
+        </div>
+        {m.role === "assistant" && m.content && !streaming && (
+          <div className="mt-1 flex gap-1 opacity-0 transition group-hover:opacity-100">
+            {([1, -1] as const).map((r) => (
+              <button
+                key={r}
+                onClick={() => onFeedback(index, r)}
+                title={r === 1 ? "Good reply" : "Not great — Sanctum will adjust"}
+                className={`rounded-md px-1.5 py-0.5 text-[11px] transition ${
+                  rating === r
+                    ? r === 1
+                      ? "bg-emerald-500/15 text-emerald-300"
+                      : "bg-rose-500/15 text-rose-300"
+                    : "text-slate-600 hover:bg-white/[0.06] hover:text-slate-300"
+                }`}
+              >
+                {r === 1 ? "👍" : "👎"}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 export default function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -35,9 +99,20 @@ export default function Chat() {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // C12: coalesce scrolls to one per animation frame. While streaming, messages
+  // change per chunk — a smooth scrollIntoView each time restarts its animation
+  // constantly (janky + layout thrash). rAF throttle + 'auto' during busy keeps
+  // the pinned-to-bottom feel; single new messages still glide in smoothly.
+  const scrollQueued = useRef(false);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    if (scrollQueued.current) return;
+    scrollQueued.current = true;
+    const behavior: ScrollBehavior = busy ? "auto" : "smooth";
+    requestAnimationFrame(() => {
+      scrollQueued.current = false;
+      bottomRef.current?.scrollIntoView({ behavior });
+    });
+  }, [messages, busy]);
 
   // Conversation persistence: rehydrate the current session's thread on load —
   // a refresh no longer wipes the chat.
@@ -150,15 +225,24 @@ export default function Chat() {
   }
 
   // 👍/👎 — teaches Sanctum what good looks like (read by the consolidation cycle)
-  async function sendFeedback(i: number, rating: 1 | -1) {
-    if (fb[i]) return;
+  // C9: refs keep sendFeedback identity-stable, so memoized bubbles don't bust
+  // on every streamed chunk (messages/fb churn constantly during a stream).
+  const messagesRef = useRef<Msg[]>([]);
+  const fbRef = useRef<Record<number, 1 | -1>>({});
+  useEffect(() => {
+    messagesRef.current = messages;
+    fbRef.current = fb;
+  });
+  const sendFeedback = useCallback(async (i: number, rating: 1 | -1) => {
+    if (fbRef.current[i]) return;
     setFb((p) => ({ ...p, [i]: rating }));
-    const userMsg = messages[i - 1]?.role === "user" ? messages[i - 1].content : "";
+    const msgs = messagesRef.current;
+    const userMsg = msgs[i - 1]?.role === "user" ? msgs[i - 1].content : "";
     try {
       await fetch("/api/feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rating, userMsg, assistantMsg: messages[i].content }),
+        body: JSON.stringify({ rating, userMsg, assistantMsg: msgs[i].content }),
       });
     } catch {
       /* non-critical — feedback is a gift, not a guarantee */
@@ -445,49 +529,15 @@ export default function Chat() {
         ) : (
           <div className="space-y-3 pt-8">
             {messages.map((m, i) => (
-              <div
+              <MessageBubble
                 key={i}
-                className={`msg-in group flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                <div className="max-w-[85%]">
-                  <div
-                    className={
-                      m.role === "user"
-                        ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-gradient-to-br from-indigo-500 to-violet-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-[0_6px_24px_-6px_rgba(99,102,241,0.5)]"
-                        : "whitespace-pre-wrap rounded-2xl rounded-bl-md border border-white/[0.08] bg-white/[0.05] px-4 py-2.5 text-sm leading-relaxed text-slate-200"
-                    }
-                  >
-                    {m.content ||
-                      (waiting && i === messages.length - 1 ? (
-                        <span className="flex items-center gap-1.5 py-1">
-                          <span className="typing-dot" />
-                          <span className="typing-dot" />
-                          <span className="typing-dot" />
-                        </span>
-                      ) : null)}
-                  </div>
-                  {m.role === "assistant" && m.content && !(busy && i === messages.length - 1) && (
-                    <div className="mt-1 flex gap-1 opacity-0 transition group-hover:opacity-100">
-                      {([1, -1] as const).map((r) => (
-                        <button
-                          key={r}
-                          onClick={() => sendFeedback(i, r)}
-                          title={r === 1 ? "Good reply" : "Not great — Sanctum will adjust"}
-                          className={`rounded-md px-1.5 py-0.5 text-[11px] transition ${
-                            fb[i] === r
-                              ? r === 1
-                                ? "bg-emerald-500/15 text-emerald-300"
-                                : "bg-rose-500/15 text-rose-300"
-                              : "text-slate-600 hover:bg-white/[0.06] hover:text-slate-300"
-                          }`}
-                        >
-                          {r === 1 ? "👍" : "👎"}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
+                m={m}
+                index={i}
+                typing={waiting && i === messages.length - 1}
+                streaming={busy && i === messages.length - 1}
+                rating={fb[i]}
+                onFeedback={sendFeedback}
+              />
             ))}
           </div>
         )}
