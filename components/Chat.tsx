@@ -247,7 +247,7 @@ export default function Chat() {
     } catch {
       /* non-critical — feedback is a gift, not a guarantee */
     }
-  }
+  }, []);
 
   async function loadRecap() {
     setRecap("loading");
