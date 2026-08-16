@@ -17,6 +17,10 @@ export const auth = betterAuth({
   appName: "Sanctum",
   database: prismaAdapter(prisma, { provider: "postgresql" }),
   emailAndPassword: { enabled: true, minPasswordLength: 8 },
+  // Round-2 opt B5: cache the session in a signed cookie so getSession()
+  // doesn't hit Neon on every request (chat polls, graph probes, page loads).
+  // Caveat: admin-flag flips take up to maxAge to propagate.
+  session: { cookieCache: { enabled: true, maxAge: 300 } },
   user: {
     additionalFields: {
       // client can never set this (input: false) — only the hook below does
