@@ -81,17 +81,23 @@ export async function POST(req: Request) {
   // from the DB — the client no longer ships the whole thread with each request.
   const sessionId = await currentSessionId();
   await appendChatMessage(sessionId, "user", message);
-  const messages = await recentChatMessages(sessionId, 40);
+  // 18 = MAX_CHAT_HISTORY in agent.ts (the model window) — fetching more was discarded unread.
+  const messages = await recentChatMessages(sessionId, 18);
 
   // 🏷️ X5 stage 1: the very first user message names the session INSTANTLY
   // (deterministic slice, before any model call) — even a failed first reply
   // leaves a named conversation. The LLM upgrade arrives later (see finally).
+  // First-message title is known locally — no re-fetch. Otherwise the title
+  // lookup rides in parallel with chat() instead of blocking it.
+  let titleLocal: { title: string | null; title_source: string } | null = null;
   if (messages.length === 1) {
     await setSessionTitle(sessionId, message.slice(0, 48), "derived").catch(() => {});
+    titleLocal = { title: message.slice(0, 48), title_source: "derived" };
   }
-  const titleInfo = await getSessionTitleInfo(sessionId).catch(() => null);
-
-  const { stream, recalled, recalledNames, requestMessages } = await chat(messages);
+  const [{ stream, recalled, recalledNames, requestMessages }, titleInfo] = await Promise.all([
+    chat(messages),
+    titleLocal ? Promise.resolve(titleLocal) : getSessionTitleInfo(sessionId).catch(() => null),
+  ]);
   const encoder = new TextEncoder();
   let reply = "";
   // Tool-call fragments stream in piecemeal, addressed by index — accumulate
