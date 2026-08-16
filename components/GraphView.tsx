@@ -26,6 +26,34 @@ const TYPE_COLORS: Record<string, string> = {
 const colorFor = (t: string) => TYPE_COLORS[t] ?? "#94a3b8";
 const SUN = "#fcd34d";
 
+// ── C11: prerendered halo sprites ─────────────────────────────────────────
+// The old halo ran ctx.createRadialGradient per node per frame (alloc + GPU
+// upload × nodes × 60fps). Now each type color gets ONE offscreen canvas with
+// the fade-out gradient baked in; the frame loop blits it with drawImage and
+// modulates alpha via globalAlpha (boost/dim/birth factors still apply whole).
+const SPRITE_PX = 128;
+const haloSprites = new Map<string, HTMLCanvasElement>();
+function haloSprite(color: string): HTMLCanvasElement | null {
+  const hit = haloSprites.get(color);
+  if (hit) return hit;
+  if (typeof document === "undefined") return null;
+  const c = document.createElement("canvas");
+  c.width = c.height = SPRITE_PX;
+  const sctx = c.getContext("2d");
+  if (!sctx) return null;
+  const [r, g, b] = rgbOf(color);
+  const grad = sctx.createRadialGradient(SPRITE_PX / 2, SPRITE_PX / 2, SPRITE_PX * 0.05, SPRITE_PX / 2, SPRITE_PX / 2, SPRITE_PX / 2);
+  grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  sctx.fillStyle = grad;
+  sctx.fillRect(0, 0, SPRITE_PX, SPRITE_PX);
+  haloSprites.set(color, c);
+  return c;
+}
+// The screen-space vignette is static per canvas size — cache the gradient
+// instead of rebuilding it every frame.
+let vigCache: { w: number; h: number; g: CanvasGradient } | null = null;
+
 // ── smooth hover-highlight helpers ──────────────────────────────────────────
 // Per-entity factors lerp toward their target every paint frame (the canvas
 // already repaints continuously for the starfield, so easing is free).
@@ -457,10 +485,13 @@ export default function GraphView() {
             ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2);
             ctx.fill();
           }
-          const vg = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.75);
-          vg.addColorStop(0, "rgba(5,5,15,0)");
-          vg.addColorStop(1, "rgba(0,0,5,0.55)");
-          ctx.fillStyle = vg;
+          if (!vigCache || vigCache.w !== w || vigCache.h !== h) {
+            const vg = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.75);
+            vg.addColorStop(0, "rgba(5,5,15,0)");
+            vg.addColorStop(1, "rgba(0,0,5,0.55)");
+            vigCache = { w, h, g: vg };
+          }
+          ctx.fillStyle = vigCache.g;
           ctx.fillRect(0, 0, w, h);
           ctx.restore();
         }}
@@ -510,15 +541,15 @@ export default function GraphView() {
           // pop kick: easeOutBack overshoot on the RADIUS (alpha stays easeOutCubic)
           const eK = 1 + 2.70158 * Math.pow(birthF - 1, 3) + 1.70158 * Math.pow(birthF - 1, 2);
 
-          // halo — radial gradient, fades to nothing (no hard edge)
+          // halo — C11: prerendered per-color sprite, alpha-modulated blit
+          // (replaces a per-node per-frame createRadialGradient alloc)
           const haloR = r * (2.1 + 2.6 * boost) * eK;
-          const g = ctx.createRadialGradient(n.x, n.y, r * 0.4, n.x, n.y, haloR);
-          g.addColorStop(0, `rgba(${cr},${cg},${cb},${(mix(boost > 0 ? 0.55 : 0.1, 0.028, dimF) * eB).toFixed(3)})`);
-          g.addColorStop(1, color + "00");
-          ctx.fillStyle = g;
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, haloR, 0, Math.PI * 2);
-          ctx.fill();
+          const sprite = haloSprite(color);
+          if (sprite) {
+            ctx.globalAlpha = mix(boost > 0 ? 0.55 : 0.1, 0.028, dimF) * eB;
+            ctx.drawImage(sprite, n.x - haloR, n.y - haloR, haloR * 2, haloR * 2);
+            ctx.globalAlpha = 1;
+          }
 
           // core
           ctx.beginPath();
