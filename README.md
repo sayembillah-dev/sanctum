@@ -118,7 +118,7 @@ Every page and API route requires a session. Auth is handled by better-auth on t
 ## Stack
 
 - Next.js 16 (App Router, UI plus API routes), React 19, TypeScript.
-- Tailwind CSS and Ant Design 5 for the interface; react-force-graph-2d for the memory cosmos.
+- Tailwind CSS for the interface; react-force-graph-2d for the memory cosmos.
 - Authentication: better-auth with email and password, database sessions in Neon, Prisma adapter. First account is the admin; signups can be closed from the account menu.
 - Prisma ORM as the typed client for all queries. DDL stays SQL-owned (`db/migrations/*.sql`, auto-applied on dev start) because Prisma cannot manage pgvector column types; embeddings are written via raw SQL. After schema changes, mirror them in `prisma/schema.prisma` and run `npx prisma generate`.
 - Neon Postgres with pgvector: the memory graph (`dumps`, `nodes`, `edges`) plus semantic search over 1536-dimension embeddings (pgvector HNSW caps at 2000 dims).
@@ -192,7 +192,7 @@ All routes require a signed-in session except `/api/auth/*`, `GET /api/settings`
 | `/api/chat/history` | GET | Rehydrate the current session's thread and title on page load |
 | `/api/dump` | POST | Extract nodes, edges, and updates from raw text into the graph |
 | `/api/ask` | POST | Cited answers from graph context only |
-| `/api/graph` | GET | Full graph snapshot for the cosmos view; `?as_of=YYYY-MM-DD` returns the graph as it was at the end of that day |
+| `/api/graph` | GET | Full graph snapshot for the cosmos view; `?as_of=YYYY-MM-DD` returns the graph as it was at the end of that day; `?v=<version>` returns `304` when unchanged (client sends the last `X-Graph-Version` it saw) |
 | `/api/graph/node` | GET, POST | Node inspector payload; POST `{ "id", "action": "forget" }` for explicit forget |
 | `/api/tasks` | GET, POST | Task nodes as an actionable list (open first, overdue flagged); POST `{ "id", "done" }` toggles status |
 | `/api/recap` | GET | What Sanctum learned this week: growth made visible |
